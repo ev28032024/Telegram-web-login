@@ -23,6 +23,7 @@ import csv
 import json
 import contextlib
 import importlib
+import importlib.util
 import logging
 import os
 import random
@@ -479,7 +480,8 @@ def start_adspower_profile(base_url: str, profile_id: str) -> AdsPowerProfile:
         "/api/v1/browser/start",
         {
             "user_id": profile_id,
-            "launch_args": json.dumps({"new_driver": True}),
+            "launch_args": json.dumps(["--disable-blink-features=AutomationControlled"]),
+            "new_driver": 1,
         },
     )
 
