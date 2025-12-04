@@ -489,6 +489,22 @@ def _normalize_ws_endpoint(endpoint: str) -> str:
     return f"ws://{endpoint}"
 
 
+def _resolve_cdp_from_http(http_url: str) -> Optional[str]:
+    """Извлекает CDP endpoint из ``/json/version``."""
+
+    try:
+        with urlopen(f"{http_url.rstrip('/')}/json/version") as response:  # type: ignore[arg-type]
+            payload = json.load(response)
+        if isinstance(payload, dict):
+            cdp = payload.get("webSocketDebuggerUrl")
+            if isinstance(cdp, str) and cdp.strip():
+                return cdp.strip()
+    except Exception as exc:  # pragma: no cover - best effort
+        logging.warning("Не удалось получить CDP endpoint через %s: %s", http_url, exc)
+
+    return None
+
+
 def _ensure_cdp_endpoint(ws_endpoint: str, http_profile: Optional[str]) -> str:
     """Возвращает endpoint, совместимый с Playwright CDP."""
 
@@ -497,15 +513,15 @@ def _ensure_cdp_endpoint(ws_endpoint: str, http_profile: Optional[str]) -> str:
         return ws_endpoint
 
     if http_profile:
-        try:
-            with urlopen(f"{http_profile.rstrip('/')}/json/version") as response:  # type: ignore[arg-type]
-                payload = json.load(response)
-            if isinstance(payload, dict):
-                cdp = payload.get("webSocketDebuggerUrl")
-                if isinstance(cdp, str) and cdp.strip():
-                    return cdp.strip()
-        except Exception as exc:  # pragma: no cover - best effort
-            logging.warning("Не удалось получить CDP endpoint через %s: %s", http_profile, exc)
+        resolved = _resolve_cdp_from_http(http_profile)
+        if resolved:
+            return resolved
+
+    if parsed.scheme.startswith("ws") and parsed.netloc:
+        derived_http = "https" if parsed.scheme == "wss" else "http"
+        resolved = _resolve_cdp_from_http(f"{derived_http}://{parsed.netloc}")
+        if resolved:
+            return resolved
 
     if parsed.scheme.startswith("ws"):
         return f"{ws_endpoint.rstrip('/')}/devtools/browser"
