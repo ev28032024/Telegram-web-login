@@ -1207,6 +1207,10 @@ async def run_web_login_flow(
                 "input[type='tel'], input[name='phone_number'], input[inputmode='tel']"
             ).first
             await phone_input.wait_for(state="visible", timeout=20_000)
+            await phone_input.click()
+            existing_phone_value = (await phone_input.input_value()).strip()
+            if existing_phone_value:
+                await phone_input.fill("")
             await phone_input.fill(phone_normalized)
             await phone_input.press("Enter")
 
