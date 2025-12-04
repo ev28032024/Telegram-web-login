@@ -1126,26 +1126,10 @@ def _normalize_phone(phone: str) -> str:
         digits = "+" + digits
     return digits
 
-
 def _extract_login_code(text: str, min_len: int = 5, max_len: int = 6) -> Optional[str]:
-    # Сперва пробуем найти простую последовательность цифр нужной длины
     pattern = re.compile(rf"\b(\d{{{min_len},{max_len}}})\b")
     match = pattern.search(text)
-    if match:
-        return match.group(1)
-
-    # В некоторых сообщениях код приходит с пробелами/дефисами между цифрами
-    spaced_pattern = re.compile(
-        rf"(?:\d[\s\-]*){{{min_len},{max_len}}}"  # например: 1 2 3 4 5 или 12-34-56
-    )
-    spaced_match = spaced_pattern.search(text)
-    if spaced_match:
-        digits = re.sub(r"\D", "", spaced_match.group())
-        if min_len <= len(digits) <= max_len:
-            return digits
-
-    return None
-
+    return match.group(1) if match else None
 
 async def wait_for_login_code(
     client: TelegramClient,
@@ -1156,31 +1140,119 @@ async def wait_for_login_code(
     max_len: int = 6,
 ) -> str:
     """Ожидает код авторизации в официальном чате Telegram (777000)."""
-
     deadline = time.monotonic() + timeout
     last_id = since_id
 
+    # Надёжно определяем peer для сервисного бота Telegram
+    try:
+        telegram_peer = await client.get_input_entity(777000)
+    except Exception:
+        telegram_peer = "Telegram"
+
     while time.monotonic() < deadline:
         async for msg in client.iter_messages(
-            "Telegram", min_id=last_id, reverse=True, limit=20
+            telegram_peer,
+            min_id=last_id,
+            reverse=True,
+            limit=20,
         ):
             last_id = max(last_id, msg.id)
-            sender_id = (
-                getattr(getattr(msg, "sender_id", None), "user_id", None)
-                or getattr(getattr(msg, "peer_id", None), "user_id", None)
-                or getattr(msg, "sender_id", None)
-            )
-            if sender_id not in {777000, 777000000}:  # Telegram service bots
+
+            # игнорируем исходящие сообщения (наши)
+            if getattr(msg, "out", False):
                 continue
-            if msg.fwd_from or msg.via_bot_id:
-                continue
+
             text = (msg.message or "").strip()
             if not text:
                 continue
+
             code = _extract_login_code(text, min_len=min_len, max_len=max_len)
             if code:
                 logging.info("Получен код от Telegram: %s", code)
                 return code
+
+        await asyncio.sleep(max(0.2, poll_interval))
+
+    raise TimeoutError("Не удалось дождаться кода авторизации от Telegram")
+
+def _extract_login_code(text: str, min_len: int = 5, max_len: int = 6) -> Optional[str]:
+    pattern = re.compile(rf"\b(\d{{{min_len},{max_len}}})\b")
+    match = pattern.search(text)
+    return match.group(1) if match else None
+
+
+async def wait_for_login_code(
+    client: TelegramClient,
+    since_id: int,
+    timeout: int,
+    poll_interval: float = 1.0,
+    min_len: int = 5,
+    max_len: int = 6,
+    initial_delay: float = 2.0,
+) -> str:
+    """
+    Ждём КРАЙНИЙ (самый новый) код авторизации в чате с Telegram (777000),
+    игнорируя всю историю до since_id.
+
+    initial_delay — пауза перед первым опросом, чтобы успел прилететь новый код.
+    """
+
+    deadline = time.monotonic() + timeout
+    last_id = since_id or 0
+
+    # Надёжно получаем peer для официального Telegram
+    try:
+        telegram_peer = await client.get_input_entity(777000)
+    except Exception:
+        telegram_peer = "Telegram"
+
+    # Даём немного времени Telegram, чтобы прислать новый код
+    if initial_delay > 0:
+        await asyncio.sleep(initial_delay)
+
+    while time.monotonic() < deadline:
+        # Берём пачку последних сообщений (обычно от нового к старому)
+        msgs = await client.get_messages(telegram_peer, limit=30)
+
+        if msgs:
+            newest_code_msg_id: Optional[int] = None
+            newest_code_value: Optional[str] = None
+
+            for msg in msgs:
+                # пропускаем старые сообщения (до baseline/last_id)
+                if msg.id <= last_id:
+                    continue
+
+                # игнорируем исходящие (наши) сообщения
+                if getattr(msg, "out", False):
+                    continue
+
+                text = (msg.message or "").strip()
+                if not text:
+                    continue
+
+                code = _extract_login_code(text, min_len=min_len, max_len=max_len)
+                if not code:
+                    continue
+
+                # берём САМЫЙ НОВЫЙ код среди всех новых сообщений
+                if newest_code_msg_id is None or msg.id > newest_code_msg_id:
+                    newest_code_msg_id = msg.id
+                    newest_code_value = code
+
+            if newest_code_msg_id is not None and newest_code_value is not None:
+                last_id = newest_code_msg_id
+                logging.info(
+                    "Получен НОВЫЙ код от Telegram (msg_id=%s): %s",
+                    newest_code_msg_id,
+                    newest_code_value,
+                )
+                return newest_code_value
+
+            # если новых сообщений без кода больше, чем last_id — просто продвигаем маркер
+            max_seen_id = max((m.id for m in msgs), default=last_id)
+            if max_seen_id > last_id:
+                last_id = max_seen_id
 
         await asyncio.sleep(max(0.2, poll_interval))
 
@@ -1203,8 +1275,69 @@ async def run_web_login_flow(
 
     code_task: Optional[asyncio.Task[str]] = None
 
+    # --- селекторы ---
+    LOGIN_BY_PHONE_SELECTORS: Sequence[str] = [
+        # англ.
+        "button:has-text('phone number')",
+        "button:has-text('Log in by phone Number')",
+        "button:has-text('Log in by phone number')",
+        "button:has-text('Log in with phone number')",
+        "text=/Log in by phone/i",
+        # рус.
+        "button:has-text('Войти по номеру телефона')",
+        "button:has-text('По номеру телефона')",
+        "button:has-text('Номер телефона')",
+        "text=/Войти по номеру телефона/i",
+        "text=/по номеру телефона/i",
+        "text=/телефон/i",
+    ]
+
+    PHONE_INPUT_SELECTORS: Sequence[str] = [
+        # твой конкретный HTML
+        ".input-field-phone .input-field-input[contenteditable='true']",
+        ".input-field-phone [contenteditable='true']",
+        "div.input-field.input-field-phone div[contenteditable='true']",
+        "div.input-field-input[contenteditable='true'][inputmode='decimal']",
+        # обычные input’ы
+        "#sign-in-phone-number",
+        "input[name='phone_number']",
+        "input[inputmode='tel']",
+        "input[type='tel']",
+        "input[autocomplete='tel']",
+        "input[autocomplete='tel-national']",
+        "input[placeholder*='phone' i]",
+        "input[placeholder*='number' i]",
+        "input[placeholder*='телефон' i]",
+        "input[id*='phone' i]",
+        "input[name*='phone' i]",
+        "input[data-testid='login-phone-input']",
+        "input[data-testid='phone-number-input']",
+        "input[data-testid='phone-input']",
+    ]
+
+    # селекторы для поля КОДА
+    CODE_INPUT_SELECTORS: Sequence[str] = [
+        # типичные варианты Telegram
+        "input[autocomplete='one-time-code']",
+        "input[name*='code' i]",
+        "input[placeholder*='code' i]",
+        "input[placeholder*='код' i]",
+
+        # любые цифровые input'ы
+        "input[inputmode='numeric']",
+        "input[inputmode='decimal']",
+        "input[type='tel']",
+
+        # contenteditable (в стиле твоих полей)
+        ".input-field-input[contenteditable='true'][inputmode='numeric']",
+        ".input-field-input[contenteditable='true'][inputmode='decimal']",
+        ".input-field-input[contenteditable='true']",
+        "div[contenteditable='true'][inputmode='numeric']",
+        "div[contenteditable='true'][inputmode='decimal']",
+    ]
+
     async def find_first_visible(selectors: Sequence[str], timeout: int = 20_000):
-        # Ищем по странице и во фреймах (иногда форма во фрейме)
+        # Поиск на странице и во фреймах
         search_contexts = [page, *page.frames]
 
         for selector in selectors:
@@ -1218,7 +1351,7 @@ async def run_web_login_flow(
                     continue
 
         raise TimeoutError(
-            "Не удалось найти видимое поле ввода среди: " + ", ".join(selectors)
+            "Не удалось найти видимый элемент среди: " + ", ".join(selectors)
         )
 
     async def click_first_visible(selectors: Sequence[str], timeout: int = 5_000) -> bool:
@@ -1237,47 +1370,6 @@ async def run_web_login_flow(
 
         return False
 
-    # --- кнопка "Log in by phone" ---
-    LOGIN_BY_PHONE_SELECTORS: Sequence[str] = [
-        # англ.
-        "button:has-text('phone number')",
-        "button:has-text('Log in by phone Number')",
-        "button:has-text('Log in by phone number')",
-        "button:has-text('Log in with phone number')",
-        "text=/Log in by phone/i",
-        # рус.
-        "button:has-text('Войти по номеру телефона')",
-        "button:has-text('По номеру телефона')",
-        "button:has-text('Номер телефона')",
-        "text=/Войти по номеру телефона/i",
-        "text=/по номеру телефона/i",
-        "text=/телефон/i",
-    ]
-
-    # --- поле телефона ---
-    # В первую очередь — твой HTML: contenteditable внутри .input-field-phone
-    PHONE_INPUT_SELECTORS: Sequence[str] = [
-        ".input-field-phone .input-field-input[contenteditable='true']",
-        ".input-field-phone [contenteditable='true']",
-        "div.input-field.input-field-phone div[contenteditable='true']",
-        "div.input-field-input[contenteditable='true'][inputmode='decimal']",
-        # запасные варианты под старый дизайн
-        "#sign-in-phone-number",
-        "input[name='phone_number']",
-        "input[inputmode='tel']",
-        "input[type='tel']",
-        "input[autocomplete='tel']",
-        "input[autocomplete='tel-national']",
-        "input[placeholder*='phone' i]",
-        "input[placeholder*='number' i]",
-        "input[placeholder*='телефон' i]",
-        "input[id*='phone' i]",
-        "input[name*='phone' i]",
-        "input[data-testid='login-phone-input']",
-        "input[data-testid='phone-number-input']",
-        "input[data-testid='phone-input']",
-    ]
-
     try:
         async with async_playwright() as playwright:
             browser = await playwright.chromium.connect_over_cdp(profile.ws_endpoint)
@@ -1287,14 +1379,14 @@ async def run_web_login_flow(
             await page.goto("https://web.telegram.org/k/", wait_until="domcontentloaded")
             await page.wait_for_timeout(1500)
 
-            # 1. Пробуем сразу найти поле телефона (если форма уже открыта)
+            # 1. Пытаемся сразу найти поле телефона
             try:
                 phone_input = await find_first_visible(
                     PHONE_INPUT_SELECTORS,
                     timeout=8_000,
                 )
             except TimeoutError:
-                # 2. Поля нет → переключаемся с QR на вход по номеру
+                # 2. Если не нашли — жмём "Log in by phone"
                 clicked = await click_first_visible(
                     LOGIN_BY_PHONE_SELECTORS,
                     timeout=10_000,
@@ -1313,9 +1405,8 @@ async def run_web_login_flow(
 
             # --- ВВОД ТЕЛЕФОНА ---
 
-            # Кликаем и пытаемся очистить поле
             await phone_input.click()
-            # Ctrl+A + Backspace — как у живого пользователя
+            # Ctrl+A + Backspace — чистим поле
             with contextlib.suppress(Exception):
                 await phone_input.press("Control+A")
                 await phone_input.press("Backspace")
@@ -1332,8 +1423,8 @@ async def run_web_login_flow(
                 visible_text = await phone_input.inner_text()
             except Exception:
                 visible_text = ""
-            digits_full = re.sub(r"\\D", "", phone_normalized)
-            digits_visible = re.sub(r"\\D", "", visible_text)
+            digits_full = re.sub(r"\D", "", phone_normalized)
+            digits_visible = re.sub(r"\D", "", visible_text)
 
             # Если в поле только код страны (префикс), а хвост номера "отвалился" —
             # добиваем хвост отдельно
@@ -1344,75 +1435,46 @@ async def run_web_login_flow(
                     digits_visible,
                     tail,
                 )
-                # Набираем только оставшиеся цифры (без плюса)
                 await phone_input.type(tail, delay=50)
                 await page.wait_for_timeout(200)
 
+            # Отправляем номер — Telegram должен выслать СМС/код в личку
             await phone_input.press("Enter")
 
-            # --- ждём код от 777000 в клиенте Telethon ---
-            code_task = asyncio.create_task(
-                wait_for_login_code(
-                    client,
-                    baseline_msg_id,
-                    timeout=code_timeout,
-                    poll_interval=poll_interval,
-                )
-            )
+            # === ЭТАП ВВОДА КОДА ===
 
-            # Поле ввода кода на веб-стране
-            code_inputs_locator = page.locator(
+            # 1) Ждём, пока на вебе появится форма ввода кода
+            code_input = page.locator(
                 "input[autocomplete='one-time-code'], "
                 "input[inputmode='numeric'], "
                 "input[type='tel'], "
-                "input[name*='code' i], "
-                "input[data-testid*='code' i], "
-                "div[contenteditable='true'][inputmode='numeric'], "
-                "div[contenteditable='true'][data-testid*='code' i]"
-            )
-            await code_inputs_locator.first.wait_for(
-                state="visible", timeout=max(15_000, code_timeout * 1000)
+                "div[contenteditable='true'][inputmode='numeric']"
+            ).first
+            await code_input.wait_for(
+                state="visible",
+                timeout=max(15_000, code_timeout * 1000),
             )
 
-            code = await code_task
+            # 2) Запускаем ожидание кода ОТДЕЛЬНО, уже после перехода на экран ввода
+            #    и с небольшой задержкой, чтобы успел прийти НОВЫЙ код
+            initial_delay = 2.0  # можешь подкрутить при желании
 
-            async def _visible_inputs() -> List[Any]:
-                inputs: List[Any] = []
-                for idx in range(await code_inputs_locator.count()):
-                    candidate = code_inputs_locator.nth(idx)
-                    try:
-                        if await candidate.is_visible():
-                            inputs.append(candidate)
-                    except Exception:
-                        continue
-                return inputs
-
-            visible_inputs = await _visible_inputs()
-
-            if len(visible_inputs) > 1 and len(code) <= len(visible_inputs):
-                logging.debug(
-                    "Заполняем код по цифрам в %d отдельных полей", len(visible_inputs)
+            code_task = asyncio.create_task(
+                wait_for_login_code(
+                    client=client,
+                    since_id=baseline_msg_id,
+                    timeout=code_timeout,
+                    poll_interval=poll_interval,
+                    min_len=5,
+                    max_len=6,
+                    initial_delay=initial_delay,
                 )
-                for digit, field in zip(code, visible_inputs):
-                    try:
-                        await field.fill("")
-                    except Exception:
-                        with contextlib.suppress(Exception):
-                            await field.evaluate("el => { el.innerText = ''; el.textContent = ''; }")
-                    await field.click()
-                    await field.type(digit)
-                await visible_inputs[-1].press("Enter")
-            else:
-                code_input = visible_inputs[0] if visible_inputs else code_inputs_locator.first
-                try:
-                    await code_input.fill("")
-                except Exception:
-                    with contextlib.suppress(Exception):
-                        await code_input.evaluate("el => { el.innerText = ''; el.textContent = ''; }")
-                await code_input.click()
-                await code_input.type(code)
-                await code_input.press("Enter")
+            )
 
+            # 3) Забираем код и вводим его в форму
+            code = await code_task
+            await code_input.fill(code)
+            await code_input.press("Enter")
             logging.info("Код авторизации введён в браузер")
 
             # --- 2FA, если есть ---
