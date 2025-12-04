@@ -472,6 +472,23 @@ def _call_adspower_api(base_url: str, path: str, params: Dict[str, str]) -> Dict
     return data
 
 
+def _normalize_ws_endpoint(endpoint: str) -> str:
+    """Приводит websocket endpoint AdsPower к корректному формату."""
+
+    endpoint = endpoint.strip()
+    if not endpoint:
+        return endpoint
+
+    parsed = urlparse(endpoint)
+    if parsed.scheme:
+        return endpoint
+
+    if endpoint.startswith("//"):
+        return f"ws:{endpoint}"
+
+    return f"ws://{endpoint}"
+
+
 def start_adspower_profile(base_url: str, profile_id: str) -> AdsPowerProfile:
     """Запускает профиль AdsPower и возвращает параметры подключения."""
 
@@ -491,6 +508,8 @@ def start_adspower_profile(base_url: str, profile_id: str) -> AdsPowerProfile:
 
     if not ws_endpoint:
         raise RuntimeError("AdsPower не вернул websocket endpoint для профиля")
+
+    ws_endpoint = _normalize_ws_endpoint(ws_endpoint)
 
     http_profile = data.get("http") or data.get("http_proxy")
     return AdsPowerProfile(ws_endpoint=ws_endpoint, http_profile=http_profile, browser_pid=data.get("browser_pid"))
@@ -1136,7 +1155,13 @@ async def run_web_login_flow(
             context = browser.contexts[0] if browser.contexts else await browser.new_context()
             page = context.pages[0] if context.pages else await context.new_page()
 
-            await page.goto("https://web.telegram.org/k/", wait_until="domcontentloaded")
+            await page.goto("https://web.telegram.org/", wait_until="domcontentloaded")
+
+            login_button = page.get_by_role("button", name=re.compile("phone", re.IGNORECASE))
+            with contextlib.suppress(Exception):
+                if await login_button.is_visible(timeout=5_000):
+                    await login_button.click()
+
             phone_input = page.locator(
                 "input[type='tel'], input[name='phone_number'], input[inputmode='tel']"
             ).first
