@@ -1833,7 +1833,7 @@ async def handle_adspower_login(args: argparse.Namespace) -> int:
                 client,
                 profile,
                 phone,
-                baseline_id=baseline_id,
+                baseline_msg_id=baseline_id,
                 code_timeout=args.code_timeout,
                 poll_interval=args.poll_interval,
                 two_fa=args.two_fa,
