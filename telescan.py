@@ -1128,9 +1128,23 @@ def _normalize_phone(phone: str) -> str:
 
 
 def _extract_login_code(text: str, min_len: int = 5, max_len: int = 6) -> Optional[str]:
+    # Сперва пробуем найти простую последовательность цифр нужной длины
     pattern = re.compile(rf"\b(\d{{{min_len},{max_len}}})\b")
     match = pattern.search(text)
-    return match.group(1) if match else None
+    if match:
+        return match.group(1)
+
+    # В некоторых сообщениях код приходит с пробелами/дефисами между цифрами
+    spaced_pattern = re.compile(
+        rf"(?:\d[\s\-]*){{{min_len},{max_len}}}"  # например: 1 2 3 4 5 или 12-34-56
+    )
+    spaced_match = spaced_pattern.search(text)
+    if spaced_match:
+        digits = re.sub(r"\D", "", spaced_match.group())
+        if min_len <= len(digits) <= max_len:
+            return digits
+
+    return None
 
 
 async def wait_for_login_code(
