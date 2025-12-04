@@ -1190,6 +1190,18 @@ async def run_web_login_flow(
 
     code_task: Optional[asyncio.Task[str]] = None
 
+    async def find_first_visible(selectors: Sequence[str], timeout: int = 20_000):
+        for selector in selectors:
+            locator = page.locator(selector).first
+            try:
+                await locator.wait_for(state="visible", timeout=timeout)
+                return locator
+            except Exception:
+                continue
+        raise TimeoutError(
+            "Не удалось найти видимое поле ввода среди: " + ", ".join(selectors)
+        )
+
     try:
         async with async_playwright() as playwright:
             browser = await playwright.chromium.connect_over_cdp(profile.ws_endpoint)
@@ -1203,10 +1215,14 @@ async def run_web_login_flow(
                 if await login_button.is_visible(timeout=5_000):
                     await login_button.click()
 
-            phone_input = page.locator(
-                "input[type='tel'], input[name='phone_number'], input[inputmode='tel']"
-            ).first
-            await phone_input.wait_for(state="visible", timeout=20_000)
+            phone_input = await find_first_visible(
+                [
+                    "#sign-in-phone-number",
+                    "input[name='phone_number']",
+                    "input[inputmode='tel']",
+                    "input[type='tel']",
+                ]
+            )
             await phone_input.click()
             existing_phone_value = (await phone_input.input_value()).strip()
             if existing_phone_value:
