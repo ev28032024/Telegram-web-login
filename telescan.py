@@ -489,6 +489,30 @@ def _normalize_ws_endpoint(endpoint: str) -> str:
     return f"ws://{endpoint}"
 
 
+def _ensure_cdp_endpoint(ws_endpoint: str, http_profile: Optional[str]) -> str:
+    """Возвращает endpoint, совместимый с Playwright CDP."""
+
+    parsed = urlparse(ws_endpoint)
+    if parsed.scheme.startswith("ws") and parsed.path and parsed.path != "/":
+        return ws_endpoint
+
+    if http_profile:
+        try:
+            with urlopen(f"{http_profile.rstrip('/')}/json/version") as response:  # type: ignore[arg-type]
+                payload = json.load(response)
+            if isinstance(payload, dict):
+                cdp = payload.get("webSocketDebuggerUrl")
+                if isinstance(cdp, str) and cdp.strip():
+                    return cdp.strip()
+        except Exception as exc:  # pragma: no cover - best effort
+            logging.warning("Не удалось получить CDP endpoint через %s: %s", http_profile, exc)
+
+    if parsed.scheme.startswith("ws"):
+        return f"{ws_endpoint.rstrip('/')}/devtools/browser"
+
+    return ws_endpoint
+
+
 def start_adspower_profile(base_url: str, profile_id: str) -> AdsPowerProfile:
     """Запускает профиль AdsPower и возвращает параметры подключения."""
 
@@ -509,9 +533,10 @@ def start_adspower_profile(base_url: str, profile_id: str) -> AdsPowerProfile:
     if not ws_endpoint:
         raise RuntimeError("AdsPower не вернул websocket endpoint для профиля")
 
-    ws_endpoint = _normalize_ws_endpoint(ws_endpoint)
-
     http_profile = data.get("http") or data.get("http_proxy")
+    ws_endpoint = _normalize_ws_endpoint(ws_endpoint)
+    ws_endpoint = _ensure_cdp_endpoint(ws_endpoint, http_profile)
+
     return AdsPowerProfile(ws_endpoint=ws_endpoint, http_profile=http_profile, browser_pid=data.get("browser_pid"))
 
 
