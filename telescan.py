@@ -1347,17 +1347,58 @@ async def run_web_login_flow(
             )
 
             # Поле ввода кода на веб-стране
-            code_input = page.locator(
+            code_inputs_locator = page.locator(
                 "input[autocomplete='one-time-code'], "
                 "input[inputmode='numeric'], "
                 "input[type='tel'], "
-                "div[contenteditable='true'][inputmode='numeric']"
-            ).first
-            await code_input.wait_for(state="visible", timeout=max(15_000, code_timeout * 1000))
+                "input[name*='code' i], "
+                "input[data-testid*='code' i], "
+                "div[contenteditable='true'][inputmode='numeric'], "
+                "div[contenteditable='true'][data-testid*='code' i]"
+            )
+            await code_inputs_locator.first.wait_for(
+                state="visible", timeout=max(15_000, code_timeout * 1000)
+            )
 
             code = await code_task
-            await code_input.fill(code)
-            await code_input.press("Enter")
+
+            async def _visible_inputs() -> List[Any]:
+                inputs: List[Any] = []
+                for idx in range(await code_inputs_locator.count()):
+                    candidate = code_inputs_locator.nth(idx)
+                    try:
+                        if await candidate.is_visible():
+                            inputs.append(candidate)
+                    except Exception:
+                        continue
+                return inputs
+
+            visible_inputs = await _visible_inputs()
+
+            if len(visible_inputs) > 1 and len(code) <= len(visible_inputs):
+                logging.debug(
+                    "Заполняем код по цифрам в %d отдельных полей", len(visible_inputs)
+                )
+                for digit, field in zip(code, visible_inputs):
+                    try:
+                        await field.fill("")
+                    except Exception:
+                        with contextlib.suppress(Exception):
+                            await field.evaluate("el => { el.innerText = ''; el.textContent = ''; }")
+                    await field.click()
+                    await field.type(digit)
+                await visible_inputs[-1].press("Enter")
+            else:
+                code_input = visible_inputs[0] if visible_inputs else code_inputs_locator.first
+                try:
+                    await code_input.fill("")
+                except Exception:
+                    with contextlib.suppress(Exception):
+                        await code_input.evaluate("el => { el.innerText = ''; el.textContent = ''; }")
+                await code_input.click()
+                await code_input.type(code)
+                await code_input.press("Enter")
+
             logging.info("Код авторизации введён в браузер")
 
             # --- 2FA, если есть ---
