@@ -1191,13 +1191,17 @@ async def run_web_login_flow(
     code_task: Optional[asyncio.Task[str]] = None
 
     async def find_first_visible(selectors: Sequence[str], timeout: int = 20_000):
+        search_contexts = [page, *page.frames]
+
         for selector in selectors:
-            locator = page.locator(selector).first
-            try:
-                await locator.wait_for(state="visible", timeout=timeout)
-                return locator
-            except Exception:
-                continue
+            for context in search_contexts:
+                locator = context.locator(selector).first
+                try:
+                    await locator.wait_for(state="visible", timeout=timeout)
+                    return locator
+                except Exception:
+                    continue
+
         raise TimeoutError(
             "Не удалось найти видимое поле ввода среди: " + ", ".join(selectors)
         )
