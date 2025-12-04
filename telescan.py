@@ -21,9 +21,12 @@ import argparse
 import asyncio
 import csv
 import json
+import contextlib
+import importlib
 import logging
 import os
 import random
+import re
 import shutil
 import sys
 import tempfile
@@ -34,7 +37,9 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, Iterable, List, Optional, Sequence, Set, Tuple
-from urllib.parse import urlparse
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode, urlparse
+from urllib.request import urlopen
 
 try:
     from telethon import TelegramClient
@@ -49,6 +54,12 @@ try:  # pragma: no cover - опциональная зависимость
     from tqdm.asyncio import tqdm
 except ImportError as exc:
     raise SystemExit("[ERROR] Требуется установить tqdm: pip install tqdm") from exc
+
+_playwright_spec = importlib.util.find_spec("playwright.async_api")
+if _playwright_spec:  # pragma: no cover - опциональная зависимость
+    async_playwright = importlib.import_module("playwright.async_api").async_playwright
+else:  # pragma: no cover - зависимость по требованию
+    async_playwright = None
 
 try:  # pragma: no cover - опциональная зависимость
     from opentele.api import UseCurrentSession
@@ -322,6 +333,15 @@ class ConversionResult:
     api_label: Optional[str] = None
 
 
+@dataclass
+class AdsPowerProfile:
+    """Параметры запущенного профиля AdsPower."""
+
+    ws_endpoint: str
+    http_profile: Optional[str]
+    browser_pid: Optional[int]
+
+
 # ---------------------------------------------------------------------------
 # Helpers: API, proxies, filesystem
 # ---------------------------------------------------------------------------
@@ -410,6 +430,77 @@ def get_telethon_proxy(proxy: ProxySpec) -> tuple:
     }
     proxy_type = proxy_map.get(proxy.scheme, socks.SOCKS5)
     return (proxy_type, proxy.host, proxy.port, True, proxy.username, proxy.password)
+
+
+# ---------------------------------------------------------------------------
+# AdsPower helpers
+# ---------------------------------------------------------------------------
+
+
+def require_playwright() -> None:
+    """Проверяет доступность Playwright и подсказывает команду установки."""
+
+    if async_playwright is None:
+        raise SystemExit(
+            "[ERROR] Требуется установить playwright: pip install playwright && playwright install chromium"
+        )
+
+
+def _call_adspower_api(base_url: str, path: str, params: Dict[str, str]) -> Dict[str, Any]:
+    """Вспомогательная функция для запросов к локальному API AdsPower."""
+
+    url = f"{base_url.rstrip('/')}{path}?{urlencode(params)}"
+    try:
+        with urlopen(url) as response:  # type: ignore[arg-type]
+            payload = json.load(response)
+    except HTTPError as exc:  # pragma: no cover - сетевые ошибки
+        raise RuntimeError(f"AdsPower API HTTP error: {exc.code}") from exc
+    except URLError as exc:  # pragma: no cover - сетевые ошибки
+        raise RuntimeError(f"AdsPower API connection error: {exc.reason}") from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Некорректный ответ AdsPower API") from exc
+
+    code = payload.get("code")
+    if code not in (0, "0"):
+        message = payload.get("msg") or payload.get("message") or "неизвестная ошибка"
+        raise RuntimeError(f"AdsPower API error: {message}")
+
+    data = payload.get("data") or {}
+    if not isinstance(data, dict):
+        raise RuntimeError("AdsPower API вернул неожиданный формат данных")
+    return data
+
+
+def start_adspower_profile(base_url: str, profile_id: str) -> AdsPowerProfile:
+    """Запускает профиль AdsPower и возвращает параметры подключения."""
+
+    data = _call_adspower_api(
+        base_url,
+        "/api/v1/browser/start",
+        {
+            "user_id": profile_id,
+            "launch_args": json.dumps({"new_driver": True}),
+        },
+    )
+
+    ws_endpoint = data.get("ws", {}).get("selenium") or data.get("ws", {}).get("puppeteer")
+    if not ws_endpoint:
+        ws_endpoint = data.get("ws", {}).get("browser")
+
+    if not ws_endpoint:
+        raise RuntimeError("AdsPower не вернул websocket endpoint для профиля")
+
+    http_profile = data.get("http") or data.get("http_proxy")
+    return AdsPowerProfile(ws_endpoint=ws_endpoint, http_profile=http_profile, browser_pid=data.get("browser_pid"))
+
+
+def stop_adspower_profile(base_url: str, profile_id: str) -> None:
+    """Останавливает профиль AdsPower."""
+
+    try:
+        _call_adspower_api(base_url, "/api/v1/browser/stop", {"user_id": profile_id})
+    except Exception as exc:  # pragma: no cover - best effort
+        logging.warning("Не удалось корректно остановить профиль AdsPower %s: %s", profile_id, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -960,6 +1051,133 @@ async def telegram_client_manager(
             await client.disconnect()
 
 
+# ---------------------------------------------------------------------------
+# Telegram login helpers
+# ---------------------------------------------------------------------------
+
+
+def _normalize_phone(phone: str) -> str:
+    digits = re.sub(r"[^0-9]", "", phone)
+    if not digits:
+        return phone
+    if not digits.startswith("+"):
+        digits = "+" + digits
+    return digits
+
+
+def _extract_login_code(text: str, min_len: int = 5, max_len: int = 6) -> Optional[str]:
+    pattern = re.compile(rf"\b(\d{{{min_len},{max_len}}})\b")
+    match = pattern.search(text)
+    return match.group(1) if match else None
+
+
+async def wait_for_login_code(
+    client: TelegramClient,
+    since_id: int,
+    timeout: int,
+    poll_interval: float = 1.0,
+    min_len: int = 5,
+    max_len: int = 6,
+) -> str:
+    """Ожидает код авторизации в официальном чате Telegram (777000)."""
+
+    deadline = time.monotonic() + timeout
+    last_id = since_id
+
+    while time.monotonic() < deadline:
+        async for msg in client.iter_messages(
+            "Telegram", min_id=last_id, reverse=True, limit=20
+        ):
+            last_id = max(last_id, msg.id)
+            sender_id = (
+                getattr(getattr(msg, "sender_id", None), "user_id", None)
+                or getattr(getattr(msg, "peer_id", None), "user_id", None)
+                or getattr(msg, "sender_id", None)
+            )
+            if sender_id not in {777000, 777000000}:  # Telegram service bots
+                continue
+            if msg.fwd_from or msg.via_bot_id:
+                continue
+            text = (msg.message or "").strip()
+            if not text:
+                continue
+            code = _extract_login_code(text, min_len=min_len, max_len=max_len)
+            if code:
+                logging.info("Получен код от Telegram: %s", code)
+                return code
+
+        await asyncio.sleep(max(0.2, poll_interval))
+
+    raise TimeoutError("Не удалось дождаться кода авторизации от Telegram")
+
+
+async def run_web_login_flow(
+    client: TelegramClient,
+    profile: AdsPowerProfile,
+    phone: str,
+    baseline_msg_id: int,
+    code_timeout: int,
+    poll_interval: float,
+    two_fa: Optional[str],
+) -> None:
+    """Проходит авторизацию на web.telegram.org внутри профиля AdsPower."""
+
+    require_playwright()
+    phone_normalized = _normalize_phone(phone)
+    logging.info("Используем номер %s для входа", phone_normalized)
+
+    code_task: Optional[asyncio.Task[str]] = None
+
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.connect_over_cdp(profile.ws_endpoint)
+            context = browser.contexts[0] if browser.contexts else await browser.new_context()
+            page = context.pages[0] if context.pages else await context.new_page()
+
+            await page.goto("https://web.telegram.org/k/", wait_until="domcontentloaded")
+            phone_input = page.locator(
+                "input[type='tel'], input[name='phone_number'], input[inputmode='tel']"
+            ).first
+            await phone_input.wait_for(state="visible", timeout=20_000)
+            await phone_input.fill(phone_normalized)
+            await phone_input.press("Enter")
+
+            code_task = asyncio.create_task(
+                wait_for_login_code(
+                    client,
+                    baseline_msg_id,
+                    timeout=code_timeout,
+                    poll_interval=poll_interval,
+                )
+            )
+
+            code_input = page.locator(
+                "input[autocomplete='one-time-code'], input[type='tel'], input[inputmode='numeric']"
+            ).first
+            await code_input.wait_for(state="visible", timeout=max(15_000, code_timeout * 1000))
+            code = await code_task
+            await code_input.fill(code)
+            await code_input.press("Enter")
+            logging.info("Код авторизации введён в браузер")
+
+            if two_fa:
+                password_input = page.locator(
+                    "input[type='password'], input[name='password'], input[autocomplete='current-password']"
+                ).first
+                await password_input.wait_for(state="visible", timeout=60_000)
+                await password_input.fill(two_fa)
+                await password_input.press("Enter")
+                logging.info("Пароль 2FA введён")
+
+            await page.wait_for_timeout(1500)
+            await browser.close()
+    finally:
+        if code_task and not code_task.done():
+            code_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await code_task
+
+
 async def check_session_async(
     key: str,
     session_value: Optional[str],
@@ -1479,6 +1697,55 @@ def build_parser(
         help="Не удалять временные копии tdata",
     )
 
+    # --- ADSPOWER ---
+    adspower_parser = subparsers.add_parser(
+        "adspower-login",
+        help="Вход в web.telegram.org через профиль AdsPower",
+    )
+    adspower_parser.add_argument(
+        "--session",
+        required=True,
+        help="Путь к Telethon .session файлу",
+    )
+    adspower_parser.add_argument("--api-id", type=int, required=True, help="api_id для Telethon")
+    adspower_parser.add_argument("--api-hash", required=True, help="api_hash для Telethon")
+    adspower_parser.add_argument(
+        "--profile-id",
+        required=True,
+        help="user_id профиля в AdsPower",
+    )
+    adspower_parser.add_argument(
+        "--phone",
+        help="Номер телефона для логина (по умолчанию берётся из сессии)",
+    )
+    adspower_parser.add_argument(
+        "--two-fa",
+        help="Пароль двухфакторной аутентификации Telegram (если включён)",
+    )
+    adspower_parser.add_argument(
+        "--adspower-base",
+        default="http://local.adspower.net:50325",
+        help="Базовый URL локального API AdsPower",
+    )
+    adspower_parser.add_argument(
+        "--code-timeout",
+        type=int,
+        default=180,
+        help="Таймаут ожидания кода входа от Telegram (сек)",
+    )
+    adspower_parser.add_argument(
+        "--poll-interval",
+        type=float,
+        default=1.0,
+        help="Интервал опроса диалога с Telegram (сек)",
+    )
+    adspower_parser.add_argument(
+        "--connect-timeout",
+        type=int,
+        default=20,
+        help="Таймаут подключения к Telegram",
+    )
+
     # --- CONVERT ---
     convert_parser = subparsers.add_parser(
         "convert",
@@ -1524,6 +1791,58 @@ def build_parser(
     )
 
     return parser
+
+
+async def handle_adspower_login(args: argparse.Namespace) -> int:
+    require_playwright()
+
+    session_path = Path(args.session).expanduser()
+    if not session_path.exists():
+        logging.error("Файл сессии не найден: %s", session_path)
+        return 1
+
+    try:
+        profile = start_adspower_profile(args.adspower_base, args.profile_id)
+        logging.info("Профиль AdsPower запущен: %s", args.profile_id)
+    except Exception as exc:
+        logging.error("Не удалось запустить профиль AdsPower: %s", exc)
+        return 1
+
+    async with telegram_client_manager(
+        str(session_path), args.api_id, args.api_hash, None, args.connect_timeout
+    ) as client:
+        if not await client.is_user_authorized():
+            logging.error("Сессия %s не авторизована", session_path)
+            stop_adspower_profile(args.adspower_base, args.profile_id)
+            return 1
+
+        me = await client.get_me()
+        phone = args.phone or getattr(me, "phone", None)
+        if not phone:
+            logging.error("Не удалось определить номер телефона из сессии")
+            stop_adspower_profile(args.adspower_base, args.profile_id)
+            return 1
+
+        latest = await client.get_messages("Telegram", limit=1)
+        baseline_id = latest[0].id if latest else 0
+
+        try:
+            await run_web_login_flow(
+                client,
+                profile,
+                phone,
+                baseline_id=baseline_id,
+                code_timeout=args.code_timeout,
+                poll_interval=args.poll_interval,
+                two_fa=args.two_fa,
+            )
+            logging.info("Авторизация в web.telegram.org завершена")
+            return 0
+        except Exception as exc:
+            logging.error("Ошибка авторизации через AdsPower: %s", exc)
+            return 1
+        finally:
+            stop_adspower_profile(args.adspower_base, args.profile_id)
 
 
 async def handle_check(args: argparse.Namespace) -> int:
@@ -1740,6 +2059,8 @@ async def main(argv: Optional[Sequence[str]] = None) -> int:
 
     apply_logging_config(config_data)
 
+    if args.command == "adspower-login":
+        return await handle_adspower_login(args)
     if args.command == "check":
         return await handle_check(args)
     if args.command == "convert":
