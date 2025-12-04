@@ -1172,7 +1172,6 @@ async def wait_for_login_code(
 
     raise TimeoutError("Не удалось дождаться кода авторизации от Telegram")
 
-
 async def run_web_login_flow(
     client: TelegramClient,
     profile: AdsPowerProfile,
@@ -1191,6 +1190,7 @@ async def run_web_login_flow(
     code_task: Optional[asyncio.Task[str]] = None
 
     async def find_first_visible(selectors: Sequence[str], timeout: int = 20_000):
+        # Ищем по странице и во фреймах (иногда форма во фрейме)
         search_contexts = [page, *page.frames]
 
         for selector in selectors:
@@ -1198,6 +1198,7 @@ async def run_web_login_flow(
                 locator = context.locator(selector).first
                 try:
                     await locator.wait_for(state="visible", timeout=timeout)
+                    logging.debug("Найден элемент по селектору: %s", selector)
                     return locator
                 except Exception:
                     continue
@@ -1215,11 +1216,53 @@ async def run_web_login_flow(
                 try:
                     await locator.wait_for(state="visible", timeout=timeout)
                     await locator.click()
+                    logging.debug("Клик по селектору: %s", selector)
                     return True
                 except Exception:
                     continue
 
         return False
+
+    # --- кнопка "Log in by phone" ---
+    LOGIN_BY_PHONE_SELECTORS: Sequence[str] = [
+        # англ.
+        "button:has-text('phone number')",
+        "button:has-text('Log in by phone Number')",
+        "button:has-text('Log in by phone number')",
+        "button:has-text('Log in with phone number')",
+        "text=/Log in by phone/i",
+        # рус.
+        "button:has-text('Войти по номеру телефона')",
+        "button:has-text('По номеру телефона')",
+        "button:has-text('Номер телефона')",
+        "text=/Войти по номеру телефона/i",
+        "text=/по номеру телефона/i",
+        "text=/телефон/i",
+    ]
+
+    # --- поле телефона ---
+    # В первую очередь — твой HTML: contenteditable внутри .input-field-phone
+    PHONE_INPUT_SELECTORS: Sequence[str] = [
+        ".input-field-phone .input-field-input[contenteditable='true']",
+        ".input-field-phone [contenteditable='true']",
+        "div.input-field.input-field-phone div[contenteditable='true']",
+        "div.input-field-input[contenteditable='true'][inputmode='decimal']",
+        # запасные варианты под старый дизайн
+        "#sign-in-phone-number",
+        "input[name='phone_number']",
+        "input[inputmode='tel']",
+        "input[type='tel']",
+        "input[autocomplete='tel']",
+        "input[autocomplete='tel-national']",
+        "input[placeholder*='phone' i]",
+        "input[placeholder*='number' i]",
+        "input[placeholder*='телефон' i]",
+        "input[id*='phone' i]",
+        "input[name*='phone' i]",
+        "input[data-testid='login-phone-input']",
+        "input[data-testid='phone-number-input']",
+        "input[data-testid='phone-input']",
+    ]
 
     try:
         async with async_playwright() as playwright:
@@ -1227,40 +1270,73 @@ async def run_web_login_flow(
             context = browser.contexts[0] if browser.contexts else await browser.new_context()
             page = context.pages[0] if context.pages else await context.new_page()
 
-            await page.goto("https://web.telegram.org/", wait_until="domcontentloaded")
+            await page.goto("https://web.telegram.org/k/", wait_until="domcontentloaded")
+            await page.wait_for_timeout(1500)
 
-            login_button = page.get_by_role("button", name=re.compile("phone", re.IGNORECASE))
-            with contextlib.suppress(Exception):
-                if await login_button.is_visible(timeout=5_000):
-                    await login_button.click()
+            # 1. Пробуем сразу найти поле телефона (если форма уже открыта)
+            try:
+                phone_input = await find_first_visible(
+                    PHONE_INPUT_SELECTORS,
+                    timeout=8_000,
+                )
+            except TimeoutError:
+                # 2. Поля нет → переключаемся с QR на вход по номеру
+                clicked = await click_first_visible(
+                    LOGIN_BY_PHONE_SELECTORS,
+                    timeout=10_000,
+                )
+                if not clicked:
+                    logging.warning(
+                        "Не удалось автоматически нажать кнопку входа по номеру телефона, "
+                        "пробуем ещё раз найти поле ввода напрямую"
+                    )
 
-            await click_first_visible(
-                [
-                    "button:has-text('phone')",
-                    "button:has-text('log in by phone')",
-                    "button:has-text('phone number')",
-                    "a:has-text('phone number')",
-                    "text=/log in (by|with) phone/i",
-                ]
-            )
+                # 3. После клика ищем поле ещё раз
+                phone_input = await find_first_visible(
+                    PHONE_INPUT_SELECTORS,
+                    timeout=15_000,
+                )
 
-            phone_input = await find_first_visible(
-                [
-                    "#sign-in-phone-number",
-                    "input[name='phone_number']",
-                    "input[inputmode='tel']",
-                    "input[type='tel']",
-                    "input[placeholder*='phone' i]",
-                    "input[data-testid='login-phone-input']",
-                ]
-            )
+            # --- ВВОД ТЕЛЕФОНА ---
+
+            # Кликаем и пытаемся очистить поле
             await phone_input.click()
-            existing_phone_value = (await phone_input.input_value()).strip()
-            if existing_phone_value:
-                await phone_input.fill("")
-            await phone_input.fill(phone_normalized)
+            # Ctrl+A + Backspace — как у живого пользователя
+            with contextlib.suppress(Exception):
+                await phone_input.press("Control+A")
+                await phone_input.press("Backspace")
+            # На всякий случай чистим innerText/textContent (для contenteditable)
+            with contextlib.suppress(Exception):
+                await phone_input.evaluate("el => { el.innerText = ''; el.textContent = ''; }")
+
+            # Набираем номер "по-человечески"
+            await phone_input.type(phone_normalized, delay=50)
+            await page.wait_for_timeout(300)
+
+            # Проверяем, что реально осталось в поле
+            try:
+                visible_text = await phone_input.inner_text()
+            except Exception:
+                visible_text = ""
+            digits_full = re.sub(r"\\D", "", phone_normalized)
+            digits_visible = re.sub(r"\\D", "", visible_text)
+
+            # Если в поле только код страны (префикс), а хвост номера "отвалился" —
+            # добиваем хвост отдельно
+            if digits_visible and digits_full.startswith(digits_visible) and len(digits_visible) < len(digits_full):
+                tail = digits_full[len(digits_visible):]
+                logging.debug(
+                    "После первой попытки в поле только код страны %r, добиваем хвост %r",
+                    digits_visible,
+                    tail,
+                )
+                # Набираем только оставшиеся цифры (без плюса)
+                await phone_input.type(tail, delay=50)
+                await page.wait_for_timeout(200)
+
             await phone_input.press("Enter")
 
+            # --- ждём код от 777000 в клиенте Telethon ---
             code_task = asyncio.create_task(
                 wait_for_login_code(
                     client,
@@ -1270,20 +1346,34 @@ async def run_web_login_flow(
                 )
             )
 
+            # Поле ввода кода на веб-стране
             code_input = page.locator(
-                "input[autocomplete='one-time-code'], input[type='tel'], input[inputmode='numeric']"
+                "input[autocomplete='one-time-code'], "
+                "input[inputmode='numeric'], "
+                "input[type='tel'], "
+                "div[contenteditable='true'][inputmode='numeric']"
             ).first
             await code_input.wait_for(state="visible", timeout=max(15_000, code_timeout * 1000))
+
             code = await code_task
             await code_input.fill(code)
             await code_input.press("Enter")
             logging.info("Код авторизации введён в браузер")
 
+            # --- 2FA, если есть ---
             if two_fa:
                 password_input = page.locator(
-                    "input[type='password'], input[name='password'], input[autocomplete='current-password']"
+                    "input[type='password'], "
+                    "input[name='password'], "
+                    "input[autocomplete='current-password'], "
+                    "div[contenteditable='true'][data-password='true']"
                 ).first
                 await password_input.wait_for(state="visible", timeout=60_000)
+                try:
+                    await password_input.fill("")
+                except Exception:
+                    with contextlib.suppress(Exception):
+                        await password_input.evaluate("el => { el.innerText = ''; el.textContent = ''; }")
                 await password_input.fill(two_fa)
                 await password_input.press("Enter")
                 logging.info("Пароль 2FA введён")
@@ -1295,7 +1385,6 @@ async def run_web_login_flow(
             code_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await code_task
-
 
 async def check_session_async(
     key: str,
