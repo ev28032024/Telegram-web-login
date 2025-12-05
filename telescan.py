@@ -1126,59 +1126,22 @@ def _normalize_phone(phone: str) -> str:
         digits = "+" + digits
     return digits
 
+
 def _extract_login_code(text: str, min_len: int = 5, max_len: int = 6) -> Optional[str]:
     pattern = re.compile(rf"\b(\d{{{min_len},{max_len}}})\b")
     match = pattern.search(text)
     return match.group(1) if match else None
 
-async def wait_for_login_code(
-    client: TelegramClient,
-    since_id: int,
-    timeout: int,
-    poll_interval: float = 1.0,
-    min_len: int = 5,
-    max_len: int = 6,
-) -> str:
-    """Ожидает код авторизации в официальном чате Telegram (777000)."""
-    deadline = time.monotonic() + timeout
-    last_id = since_id
 
-    # Надёжно определяем peer для сервисного бота Telegram
+async def resolve_telegram_peer(client: TelegramClient) -> Any:
+    """Возвращает peer для официального бота Telegram (777000)."""
+
     try:
-        telegram_peer = await client.get_input_entity(777000)
+        return await client.get_input_entity(777000)
     except Exception:
-        telegram_peer = "Telegram"
+        logging.debug("Не удалось получить peer 777000 напрямую, пробуем 'Telegram'")
 
-    while time.monotonic() < deadline:
-        async for msg in client.iter_messages(
-            telegram_peer,
-            min_id=last_id,
-            reverse=True,
-            limit=20,
-        ):
-            last_id = max(last_id, msg.id)
-
-            # игнорируем исходящие сообщения (наши)
-            if getattr(msg, "out", False):
-                continue
-
-            text = (msg.message or "").strip()
-            if not text:
-                continue
-
-            code = _extract_login_code(text, min_len=min_len, max_len=max_len)
-            if code:
-                logging.info("Получен код от Telegram: %s", code)
-                return code
-
-        await asyncio.sleep(max(0.2, poll_interval))
-
-    raise TimeoutError("Не удалось дождаться кода авторизации от Telegram")
-
-def _extract_login_code(text: str, min_len: int = 5, max_len: int = 6) -> Optional[str]:
-    pattern = re.compile(rf"\b(\d{{{min_len},{max_len}}})\b")
-    match = pattern.search(text)
-    return match.group(1) if match else None
+    return "Telegram"
 
 
 async def wait_for_login_code(
@@ -1189,6 +1152,7 @@ async def wait_for_login_code(
     min_len: int = 5,
     max_len: int = 6,
     initial_delay: float = 2.0,
+    telegram_peer: Optional[Any] = None,
 ) -> str:
     """
     Ждём КРАЙНИЙ (самый новый) код авторизации в чате с Telegram (777000),
@@ -1201,10 +1165,7 @@ async def wait_for_login_code(
     last_id = since_id or 0
 
     # Надёжно получаем peer для официального Telegram
-    try:
-        telegram_peer = await client.get_input_entity(777000)
-    except Exception:
-        telegram_peer = "Telegram"
+    peer = telegram_peer or await resolve_telegram_peer(client)
 
     # Даём немного времени Telegram, чтобы прислать новый код
     if initial_delay > 0:
@@ -1212,7 +1173,15 @@ async def wait_for_login_code(
 
     while time.monotonic() < deadline:
         # Берём пачку последних сообщений (обычно от нового к старому)
-        msgs = await client.get_messages(telegram_peer, limit=30)
+        msgs: List[Any] = []
+
+        async for msg in client.iter_messages(
+            peer,
+            min_id=last_id,
+            reverse=True,
+            limit=50,
+        ):
+            msgs.append(msg)
 
         if msgs:
             newest_code_msg_id: Optional[int] = None
@@ -1266,6 +1235,7 @@ async def run_web_login_flow(
     code_timeout: int,
     poll_interval: float,
     two_fa: Optional[str],
+    telegram_peer: Optional[Any],
 ) -> None:
     """Проходит авторизацию на web.telegram.org внутри профиля AdsPower."""
 
@@ -1517,6 +1487,7 @@ async def run_web_login_flow(
                     min_len=5,
                     max_len=6,
                     initial_delay=initial_delay,
+                    telegram_peer=telegram_peer,
                 )
             )
 
@@ -2199,8 +2170,22 @@ async def handle_adspower_login(args: argparse.Namespace) -> int:
             stop_adspower_profile(args.adspower_base, args.profile_id)
             return 1
 
-        latest = await client.get_messages("Telegram", limit=1)
-        baseline_id = latest[0].id if latest else 0
+        try:
+            telegram_peer = await resolve_telegram_peer(client)
+        except Exception as exc:
+            logging.error("Не удалось определить официальный чат Telegram: %s", exc)
+            stop_adspower_profile(args.adspower_base, args.profile_id)
+            return 1
+
+        try:
+            latest = await client.get_messages(telegram_peer, limit=1)
+            baseline_id = latest[0].id if latest else 0
+        except Exception as exc:
+            logging.warning(
+                "Не удалось получить последнее сообщение от Telegram, стартуем с since_id=0: %s",
+                exc,
+            )
+            baseline_id = 0
 
         try:
             await run_web_login_flow(
@@ -2211,6 +2196,7 @@ async def handle_adspower_login(args: argparse.Namespace) -> int:
                 code_timeout=args.code_timeout,
                 poll_interval=args.poll_interval,
                 two_fa=args.two_fa,
+                telegram_peer=telegram_peer,
             )
             logging.info("Авторизация в web.telegram.org завершена")
             return 0
