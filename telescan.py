@@ -1163,6 +1163,7 @@ async def wait_for_login_code(
 
     deadline = time.monotonic() + timeout
     last_id = since_id or 0
+    fallback_code: Optional[str] = None
 
     # Надёжно получаем peer для официального Telegram
     peer = telegram_peer or await resolve_telegram_peer(client)
@@ -1201,6 +1202,10 @@ async def wait_for_login_code(
                     newest_code_msg_id = msg.id
                     newest_code_value = code
 
+                # запоминаем любой свежий код, чтобы использовать его как запасной вариант
+                if fallback_code is None:
+                    fallback_code = code
+
             if newest_code_msg_id is not None and newest_code_value is not None:
                 last_id = newest_code_msg_id
                 logging.info(
@@ -1216,6 +1221,14 @@ async def wait_for_login_code(
                 last_id = max_seen_id
 
         await asyncio.sleep(max(0.2, poll_interval))
+
+    if fallback_code:
+        logging.warning(
+            "Не удалось получить новый код за %s секунд, пробуем последний доступный: %s",
+            timeout,
+            fallback_code,
+        )
+        return fallback_code
 
     raise TimeoutError("Не удалось дождаться кода авторизации от Telegram")
 
