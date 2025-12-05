@@ -1173,15 +1173,7 @@ async def wait_for_login_code(
 
     while time.monotonic() < deadline:
         # Берём пачку последних сообщений (обычно от нового к старому)
-        msgs: List[Any] = []
-
-        async for msg in client.iter_messages(
-            peer,
-            min_id=last_id,
-            reverse=True,
-            limit=50,
-        ):
-            msgs.append(msg)
+        msgs = await client.get_messages(peer, limit=30)
 
         if msgs:
             newest_code_msg_id: Optional[int] = None
