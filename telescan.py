@@ -1373,26 +1373,12 @@ async def run_web_login_flow(
     async def click_login_by_phone_if_present(timeout: int = 3_000) -> bool:
         """Ищет кнопку входа по номеру телефона и кликает по ней при наличии."""
 
-        if not LOGIN_BY_PHONE_SELECTORS:
-            return False
-
         search_contexts = [page, *page.frames]
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout / 1000
-
         for selector in LOGIN_BY_PHONE_SELECTORS:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                break
-
             for context in search_contexts:
-                remaining_ms = max(1, int((deadline - loop.time()) * 1000))
-                if remaining_ms <= 0:
-                    break
-
                 locator = context.locator(selector).first
                 try:
-                    await locator.wait_for(state="visible", timeout=remaining_ms)
+                    await locator.wait_for(state="visible", timeout=timeout)
                 except Exception:
                     continue
 
