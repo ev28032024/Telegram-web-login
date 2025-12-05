@@ -1336,19 +1336,6 @@ async def run_web_login_flow(
         "div[contenteditable='true'][inputmode='decimal']",
     ]
 
-    PASSWORD_INPUT_SELECTORS: Sequence[str] = [
-        # стандартные инпуты
-        "input[type='password']",
-        "input[name='password']",
-        "input[autocomplete='current-password']",
-        "input[id*='password' i]",
-        "#sign-in-password",
-
-        # contenteditable варианты
-        "div[contenteditable='true'][data-password='true']",
-        "div.input-field-input[contenteditable='true']",
-    ]
-
     async def find_first_visible(selectors: Sequence[str], timeout: int = 20_000):
         # Поиск на странице и во фреймах
         search_contexts = [page, *page.frames]
@@ -1499,8 +1486,14 @@ async def run_web_login_flow(
             # === ЭТАП ВВОДА КОДА ===
 
             # 1) Ждём, пока на вебе появится форма ввода кода
-            code_input = await find_first_visible(
-                CODE_INPUT_SELECTORS,
+            code_input = page.locator(
+                "input[autocomplete='one-time-code'], "
+                "input[inputmode='numeric'], "
+                "input[type='tel'], "
+                "div[contenteditable='true'][inputmode='numeric']"
+            ).first
+            await code_input.wait_for(
+                state="visible",
                 timeout=max(15_000, code_timeout * 1000),
             )
 
@@ -1528,21 +1521,19 @@ async def run_web_login_flow(
 
             # --- 2FA, если есть ---
             if two_fa:
-                password_input = await find_first_visible(
-                    PASSWORD_INPUT_SELECTORS,
-                    timeout=60_000,
-                )
+                password_input = page.locator(
+                    "input[type='password'], "
+                    "input[name='password'], "
+                    "input[autocomplete='current-password'], "
+                    "div[contenteditable='true'][data-password='true']"
+                ).first
+                await password_input.wait_for(state="visible", timeout=60_000)
                 try:
                     await password_input.fill("")
                 except Exception:
                     with contextlib.suppress(Exception):
                         await password_input.evaluate("el => { el.innerText = ''; el.textContent = ''; }")
-                try:
-                    await password_input.fill(two_fa)
-                except Exception:
-                    # На всякий случай имитируем ручной ввод (например, если блокируются .fill)
-                    await password_input.click()
-                    await password_input.type(two_fa, delay=80)
+                await password_input.fill(two_fa)
                 await password_input.press("Enter")
                 logging.info("Пароль 2FA введён")
 
