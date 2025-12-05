@@ -43,7 +43,7 @@ from urllib.parse import urlencode, urlparse
 from urllib.request import urlopen
 
 try:
-    from telethon import TelegramClient
+    from telethon import TelegramClient, events
     from telethon.errors import FloodWaitError, RPCError, SessionPasswordNeededError
     from telethon.sessions import StringSession
 except ImportError as exc:  # pragma: no cover - критическая ошибка конфигурации окружения
@@ -1165,72 +1165,99 @@ async def wait_for_login_code(
     last_id = since_id or 0
     fallback_code: Optional[str] = None
 
-    # Надёжно получаем peer для официального Telegram
+    # Надёжно получаем peer для официального Telegram и его сущность
     peer = telegram_peer or await resolve_telegram_peer(client)
+    entity = await client.get_entity(peer)
+    target_user_id = getattr(entity, "id", None)
+
+    # Слушаем новые сообщения параллельно с опросом, чтобы не пропустить код
+    loop = asyncio.get_running_loop()
+    push_code: "asyncio.Future[str]" = loop.create_future()
+
+    def _handle_candidate(msg_id: int, text: str) -> Optional[str]:
+        nonlocal last_id, fallback_code
+
+        if msg_id <= last_id:
+            return None
+
+        code = _extract_login_code(text, min_len=min_len, max_len=max_len)
+        if not code:
+            return None
+
+        last_id = msg_id
+        if fallback_code is None:
+            fallback_code = code
+
+        return code
+
+    @client.on(events.NewMessage(incoming=True, chats=[entity]))
+    async def _on_new_message(event: events.NewMessage.Event) -> None:  # type: ignore[name-defined]
+        if push_code.done():
+            return
+
+        msg = event.message
+        sender_id = getattr(msg.peer_id, "user_id", None) or getattr(msg, "sender_id", None)
+
+        if target_user_id is not None and sender_id != target_user_id:
+            return
+
+        text = (msg.message or "").strip()
+        if not text:
+            return
+
+        code = _handle_candidate(msg.id, text)
+        if code:
+            logging.info("Получен НОВЫЙ код от Telegram (msg_id=%s): %s", msg.id, code)
+            push_code.set_result(code)
 
     # Даём немного времени Telegram, чтобы прислать новый код
     if initial_delay > 0:
         await asyncio.sleep(initial_delay)
 
-    while time.monotonic() < deadline:
-        # Берём пачку последних сообщений (обычно от нового к старому)
-        msgs = await client.get_messages(peer, limit=30)
+    try:
+        while time.monotonic() < deadline:
+            # Берём пачку последних сообщений (обычно от нового к старому)
+            msgs = await client.get_messages(peer, limit=30)
 
-        if msgs:
-            newest_code_msg_id: Optional[int] = None
-            newest_code_value: Optional[str] = None
+            if msgs:
+                newest_code: Optional[str] = None
 
-            for msg in msgs:
-                # пропускаем старые сообщения (до baseline/last_id)
-                if msg.id <= last_id:
-                    continue
+                for msg in msgs:
+                    if getattr(msg, "out", False):
+                        continue
 
-                # игнорируем исходящие (наши) сообщения
-                if getattr(msg, "out", False):
-                    continue
+                    text = (msg.message or "").strip()
+                    if not text:
+                        continue
 
-                text = (msg.message or "").strip()
-                if not text:
-                    continue
+                    code = _handle_candidate(msg.id, text)
+                    if code:
+                        newest_code = code
 
-                code = _extract_login_code(text, min_len=min_len, max_len=max_len)
-                if not code:
-                    continue
+                if newest_code:
+                    logging.info("Получен НОВЫЙ код от Telegram (msg_id=%s): %s", last_id, newest_code)
+                    return newest_code
 
-                # берём САМЫЙ НОВЫЙ код среди всех новых сообщений
-                if newest_code_msg_id is None or msg.id > newest_code_msg_id:
-                    newest_code_msg_id = msg.id
-                    newest_code_value = code
+            # если параллельно прилетело событие — возвращаем его
+            if push_code.done():
+                return await push_code
 
-                # запоминаем любой свежий код, чтобы использовать его как запасной вариант
-                if fallback_code is None:
-                    fallback_code = code
+            await asyncio.sleep(max(0.2, poll_interval))
 
-            if newest_code_msg_id is not None and newest_code_value is not None:
-                last_id = newest_code_msg_id
-                logging.info(
-                    "Получен НОВЫЙ код от Telegram (msg_id=%s): %s",
-                    newest_code_msg_id,
-                    newest_code_value,
-                )
-                return newest_code_value
+        if push_code.done():
+            return await push_code
 
-            # если новых сообщений без кода больше, чем last_id — просто продвигаем маркер
-            max_seen_id = max((m.id for m in msgs), default=last_id)
-            if max_seen_id > last_id:
-                last_id = max_seen_id
+        if fallback_code:
+            logging.warning(
+                "Не удалось получить новый код за %s секунд, пробуем последний доступный: %s",
+                timeout,
+                fallback_code,
+            )
+            return fallback_code
 
-        await asyncio.sleep(max(0.2, poll_interval))
-
-    if fallback_code:
-        logging.warning(
-            "Не удалось получить новый код за %s секунд, пробуем последний доступный: %s",
-            timeout,
-            fallback_code,
-        )
-        return fallback_code
-
-    raise TimeoutError("Не удалось дождаться кода авторизации от Telegram")
+        raise TimeoutError("Не удалось дождаться кода авторизации от Telegram")
+    finally:
+        client.remove_event_handler(_on_new_message)
 
 async def run_web_login_flow(
     client: TelegramClient,
