@@ -1370,6 +1370,31 @@ async def run_web_login_flow(
 
         return False
 
+    async def click_login_by_phone_if_present(timeout: int = 3_000) -> bool:
+        """Ищет кнопку входа по номеру телефона и кликает по ней при наличии."""
+
+        search_contexts = [page, *page.frames]
+        for selector in LOGIN_BY_PHONE_SELECTORS:
+            for context in search_contexts:
+                locator = context.locator(selector).first
+                try:
+                    await locator.wait_for(state="visible", timeout=timeout)
+                except Exception:
+                    continue
+
+                try:
+                    await locator.click()
+                    logging.info(
+                        "Обнаружена кнопка входа по номеру телефона, выполняем клик"
+                    )
+                    return True
+                except Exception as exc:
+                    logging.debug(
+                        "Не удалось кликнуть по кнопке %s: %s", selector, exc
+                    )
+
+        return False
+
     try:
         async with async_playwright() as playwright:
             browser = await playwright.chromium.connect_over_cdp(profile.ws_endpoint)
@@ -1379,6 +1404,12 @@ async def run_web_login_flow(
             await page.goto("https://web.telegram.org/k/", wait_until="domcontentloaded")
             await page.wait_for_timeout(1500)
 
+            login_button_clicked = await click_login_by_phone_if_present(timeout=6_000)
+            if login_button_clicked:
+                logging.debug(
+                    "Кнопка входа по номеру найдена и нажата перед поиском поля телефона"
+                )
+
             # 1. Пытаемся сразу найти поле телефона
             try:
                 phone_input = await find_first_visible(
@@ -1387,10 +1418,7 @@ async def run_web_login_flow(
                 )
             except TimeoutError:
                 # 2. Если не нашли — жмём "Log in by phone"
-                clicked = await click_first_visible(
-                    LOGIN_BY_PHONE_SELECTORS,
-                    timeout=10_000,
-                )
+                clicked = await click_login_by_phone_if_present(timeout=10_000)
                 if not clicked:
                     logging.warning(
                         "Не удалось автоматически нажать кнопку входа по номеру телефона, "
