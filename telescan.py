@@ -1190,7 +1190,9 @@ async def wait_for_login_code(
 
         return code
 
-    @client.on(events.NewMessage(incoming=True, chats=[entity]))
+    # Не используем chats=[entity], чтобы не пропустить код из-за проблем резолва peer;
+    # фильтруем по отправителю вручную через target_user_id.
+    @client.on(events.NewMessage(incoming=True))
     async def _on_new_message(event: events.NewMessage.Event) -> None:  # type: ignore[name-defined]
         if push_code.done():
             return
