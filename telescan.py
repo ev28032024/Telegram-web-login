@@ -1376,6 +1376,18 @@ async def run_web_login_flow(
         "div[contenteditable='true'][inputmode='decimal']",
     ]
 
+    PHONE_SUBMIT_SELECTORS: Sequence[str] = [
+        "button:has-text('Next')",
+        "button:has-text('Continue')",
+        "button:has-text('Log in')",
+        "button:has-text('Send code')",
+        "button:has-text('Next →')",
+        "button:has-text('Далее')",
+        "button:has-text('Продолжить')",
+        "button[data-testid='login-phone-next']",
+        "button[aria-label*='next' i]",
+    ]
+
     PASSWORD_INPUT_SELECTORS: Sequence[str] = [
         # стандартные инпуты
         "input[type='password']",
@@ -1526,6 +1538,12 @@ async def run_web_login_flow(
 
             # Отправляем номер — Telegram должен выслать СМС/код в личку
             await phone_input.press("Enter")
+            # Некоторые версии веб-клиента требуют явного клика по кнопке "Next"
+            # после ввода номера. Пробуем нажать известные варианты кнопки,
+            # чтобы не застревать на экране ввода телефона.
+            submit_clicked = await click_first_visible(PHONE_SUBMIT_SELECTORS, timeout=5_000)
+            if submit_clicked:
+                logging.debug("Нажата кнопка отправки номера телефона")
             logging.info("Веб-форма: номер отправлен, ждём экран ввода кода")
 
             # === ЭТАП ВВОДА КОДА ===
