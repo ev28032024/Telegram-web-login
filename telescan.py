@@ -1154,12 +1154,7 @@ async def wait_for_login_code(
     initial_delay: float = 2.0,
     telegram_peer: Optional[Any] = None,
 ) -> str:
-    """
-    Ждём КРАЙНИЙ (самый новый) код авторизации в чате с Telegram (777000),
-    игнорируя всю историю до since_id.
-
-    initial_delay — пауза перед первым опросом, чтобы успел прилететь новый код.
-    """
+    """Возвращает код авторизации из чата 777000 с приоритетом свежих сообщений."""
 
     logging.info(
         "Ожидаем код входа от Telegram (since_id=%s, timeout=%ss, poll=%.2fs)",
@@ -1172,7 +1167,6 @@ async def wait_for_login_code(
     last_id = since_id or 0
     fallback_code: Optional[str] = None
 
-    # Надёжно получаем peer для официального Telegram и его сущность
     peer = telegram_peer or await resolve_telegram_peer(client)
     entity = await client.get_entity(peer)
     target_user_id = getattr(entity, "id", None)
@@ -1182,11 +1176,9 @@ async def wait_for_login_code(
             "будем принимать любой входящий код",
         )
 
-    # Иногда Telegram переиспользует последний код и не присылает новый.
-    # Чтобы не зависать до таймаута, заранее читаем историю и сохраняем
-    # свежий (по состоянию на старт) код как резерв.
+    # 1) Сразу читаем историю, чтобы моментально вернуть свежий код (msg_id > since_id)
     try:
-        history = await client.get_messages(peer, limit=5)
+        history = await client.get_messages(peer, limit=30)
     except Exception as exc:  # pragma: no cover - диагностический лог
         logging.debug("Не удалось прочитать историю чата с Telegram: %s", exc)
         history = []
@@ -1200,38 +1192,41 @@ async def wait_for_login_code(
             continue
 
         code = _extract_login_code(text, min_len=min_len, max_len=max_len)
-        if code:
+        if not code:
+            continue
+
+        if msg.id > since_id:
+            logging.info(
+                "Найден свежий код от Telegram (msg_id=%s > since_id=%s), возвращаем сразу",
+                msg.id,
+                since_id,
+            )
+            return code
+
+        if fallback_code is None:
             fallback_code = code
             logging.info(
-                "Найден существующий код от Telegram (msg_id=%s), используем как резерв",
+                "Сохраняем резервный код из истории (msg_id=%s): %s",
                 msg.id,
+                code,
             )
-            break
 
-    fallback_ready_after = time.monotonic() + max(10.0, poll_interval * 3)
-
-    # Слушаем новые сообщения параллельно с опросом, чтобы не пропустить код
     loop = asyncio.get_running_loop()
     push_code: "asyncio.Future[str]" = loop.create_future()
 
     def _handle_candidate(msg_id: int, text: str) -> Optional[str]:
-        nonlocal last_id, fallback_code
+        nonlocal last_id
 
         if msg_id <= last_id:
             return None
 
-        code = _extract_login_code(text, min_len=min_len, max_len=max_len)
-        if not code:
+        code_candidate = _extract_login_code(text, min_len=min_len, max_len=max_len)
+        if not code_candidate:
             return None
 
         last_id = msg_id
-        if fallback_code is None:
-            fallback_code = code
+        return code_candidate
 
-        return code
-
-    # Не используем chats=[entity], чтобы не пропустить код из-за проблем резолва peer;
-    # фильтруем по отправителю вручную через target_user_id.
     @client.on(events.NewMessage(incoming=True))
     async def _on_new_message(event: events.NewMessage.Event) -> None:  # type: ignore[name-defined]
         if push_code.done():
@@ -1249,49 +1244,41 @@ async def wait_for_login_code(
         if not text:
             return
 
-        code = _handle_candidate(msg.id, text)
-        if code:
-            logging.info("Получен НОВЫЙ код от Telegram (msg_id=%s): %s", msg.id, code)
-            push_code.set_result(code)
+        code_candidate = _handle_candidate(msg.id, text)
+        if code_candidate:
+            logging.info(
+                "Получен НОВЫЙ код от Telegram (msg_id=%s): %s",
+                msg.id,
+                code_candidate,
+            )
+            push_code.set_result(code_candidate)
 
-    # Даём немного времени Telegram, чтобы прислать новый код
     if initial_delay > 0:
         await asyncio.sleep(initial_delay)
 
     try:
         while time.monotonic() < deadline:
-            # Берём пачку последних сообщений (обычно от нового к старому)
             msgs = await client.get_messages(peer, limit=30)
 
-            if msgs:
-                newest_code: Optional[str] = None
+            for msg in msgs:
+                if getattr(msg, "out", False):
+                    continue
 
-                for msg in msgs:
-                    if getattr(msg, "out", False):
-                        continue
+                text = (msg.message or "").strip()
+                if not text:
+                    continue
 
-                    text = (msg.message or "").strip()
-                    if not text:
-                        continue
+                code_candidate = _handle_candidate(msg.id, text)
+                if code_candidate:
+                    logging.info(
+                        "Получен НОВЫЙ код от Telegram (msg_id=%s): %s",
+                        msg.id,
+                        code_candidate,
+                    )
+                    return code_candidate
 
-                    code = _handle_candidate(msg.id, text)
-                    if code:
-                        newest_code = code
-
-                if newest_code:
-                    logging.info("Получен НОВЫЙ код от Telegram (msg_id=%s): %s", last_id, newest_code)
-                    return newest_code
-
-            # если параллельно прилетело событие — возвращаем его
             if push_code.done():
                 return await push_code
-
-            if fallback_code and time.monotonic() >= fallback_ready_after:
-                logging.warning(
-                    "Новый код не получен, используем резервный код из истории: %s",
-                    fallback_code,
-                )
-                return fallback_code
 
             await asyncio.sleep(max(0.2, poll_interval))
 
@@ -1300,7 +1287,7 @@ async def wait_for_login_code(
 
         if fallback_code:
             logging.warning(
-                "Не удалось получить новый код за %s секунд, пробуем последний доступный: %s",
+                "Новый код не пришёл за %s секунд, используем резерв: %s",
                 timeout,
                 fallback_code,
             )
@@ -1515,39 +1502,27 @@ async def run_web_login_flow(
             logging.info("Веб-форма: вводим номер телефона")
 
             await phone_input.click()
-            # Ctrl+A + Backspace — чистим поле
+
+            # Агрессивно очищаем поле перед вводом
             with contextlib.suppress(Exception):
                 await phone_input.press("Control+A")
                 await phone_input.press("Backspace")
-            # На всякий случай чистим innerText/textContent (для contenteditable)
+                await phone_input.press("Delete")
+
+            with contextlib.suppress(Exception):
+                await phone_input.fill("")
+
             with contextlib.suppress(Exception):
                 await phone_input.evaluate(
-                    "el => { el.innerText = ''; el.textContent = ''; }"
+                    "el => {"
+                    " if ('value' in el) el.value = '';"
+                    " el.innerText = '';"
+                    " el.textContent = '';"
+                    " }"
                 )
 
-            # Набираем номер "по-человечески"
             await phone_input.type(phone_normalized, delay=50)
             await page.wait_for_timeout(300)
-
-            # Проверяем, что реально осталось в поле
-            try:
-                visible_text = await phone_input.inner_text()
-            except Exception:
-                visible_text = ""
-            digits_full = re.sub(r"\D", "", phone_normalized)
-            digits_visible = re.sub(r"\D", "", visible_text)
-
-            # Если в поле только код страны (префикс), а хвост номера "отвалился" —
-            # добиваем хвост отдельно
-            if digits_visible and digits_full.startswith(digits_visible) and len(digits_visible) < len(digits_full):
-                tail = digits_full[len(digits_visible):]
-                logging.debug(
-                    "После первой попытки в поле только код страны %r, добиваем хвост %r",
-                    digits_visible,
-                    tail,
-                )
-                await phone_input.type(tail, delay=50)
-                await page.wait_for_timeout(200)
 
             # Отправляем номер — Telegram должен выслать СМС/код в личку
             await phone_input.press("Enter")
