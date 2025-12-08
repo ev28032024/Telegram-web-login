@@ -1170,6 +1170,32 @@ async def wait_for_login_code(
     entity = await client.get_entity(peer)
     target_user_id = getattr(entity, "id", None)
 
+    # Иногда Telegram переиспользует последний код и не присылает новый.
+    # Чтобы не зависать до таймаута, заранее читаем историю и сохраняем
+    # свежий (по состоянию на старт) код как резерв.
+    try:
+        history = await client.get_messages(peer, limit=5)
+    except Exception as exc:  # pragma: no cover - диагностический лог
+        logging.debug("Не удалось прочитать историю чата с Telegram: %s", exc)
+        history = []
+
+    for msg in history:
+        if getattr(msg, "out", False):
+            continue
+
+        text = (msg.message or "").strip()
+        if not text:
+            continue
+
+        code = _extract_login_code(text, min_len=min_len, max_len=max_len)
+        if code:
+            fallback_code = code
+            logging.info(
+                "Найден существующий код от Telegram (msg_id=%s), используем как резерв",
+                msg.id,
+            )
+            break
+
     # Слушаем новые сообщения параллельно с опросом, чтобы не пропустить код
     loop = asyncio.get_running_loop()
     push_code: "asyncio.Future[str]" = loop.create_future()
