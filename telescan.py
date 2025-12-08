@@ -1161,6 +1161,13 @@ async def wait_for_login_code(
     initial_delay — пауза перед первым опросом, чтобы успел прилететь новый код.
     """
 
+    logging.info(
+        "Ожидаем код входа от Telegram (since_id=%s, timeout=%ss, poll=%.2fs)",
+        since_id,
+        timeout,
+        poll_interval,
+    )
+
     deadline = time.monotonic() + timeout
     last_id = since_id or 0
     fallback_code: Optional[str] = None
@@ -1169,6 +1176,11 @@ async def wait_for_login_code(
     peer = telegram_peer or await resolve_telegram_peer(client)
     entity = await client.get_entity(peer)
     target_user_id = getattr(entity, "id", None)
+    if target_user_id is None:
+        logging.warning(
+            "Не удалось определить user_id для официального чата Telegram, "
+            "будем принимать любой входящий код",
+        )
 
     # Иногда Telegram переиспользует последний код и не присылает новый.
     # Чтобы не зависать до таймаута, заранее читаем историю и сохраняем
@@ -1195,6 +1207,8 @@ async def wait_for_login_code(
                 msg.id,
             )
             break
+
+    fallback_ready_after = time.monotonic() + max(10.0, poll_interval * 3)
 
     # Слушаем новые сообщения параллельно с опросом, чтобы не пропустить код
     loop = asyncio.get_running_loop()
@@ -1224,9 +1238,11 @@ async def wait_for_login_code(
             return
 
         msg = event.message
-        sender_id = getattr(msg.peer_id, "user_id", None) or getattr(msg, "sender_id", None)
+        sender_id = getattr(msg.peer_id, "user_id", None) or getattr(
+            msg, "sender_id", None
+        )
 
-        if target_user_id is not None and sender_id != target_user_id:
+        if target_user_id and sender_id != target_user_id:
             return
 
         text = (msg.message or "").strip()
@@ -1269,6 +1285,13 @@ async def wait_for_login_code(
             # если параллельно прилетело событие — возвращаем его
             if push_code.done():
                 return await push_code
+
+            if fallback_code and time.monotonic() >= fallback_ready_after:
+                logging.warning(
+                    "Новый код не получен, используем резервный код из истории: %s",
+                    fallback_code,
+                )
+                return fallback_code
 
             await asyncio.sleep(max(0.2, poll_interval))
 
@@ -1489,6 +1512,7 @@ async def run_web_login_flow(
                 )
 
             # --- ВВОД ТЕЛЕФОНА ---
+            logging.info("Веб-форма: вводим номер телефона")
 
             await phone_input.click()
             # Ctrl+A + Backspace — чистим поле
@@ -1497,7 +1521,9 @@ async def run_web_login_flow(
                 await phone_input.press("Backspace")
             # На всякий случай чистим innerText/textContent (для contenteditable)
             with contextlib.suppress(Exception):
-                await phone_input.evaluate("el => { el.innerText = ''; el.textContent = ''; }")
+                await phone_input.evaluate(
+                    "el => { el.innerText = ''; el.textContent = ''; }"
+                )
 
             # Набираем номер "по-человечески"
             await phone_input.type(phone_normalized, delay=50)
@@ -1525,18 +1551,30 @@ async def run_web_login_flow(
 
             # Отправляем номер — Telegram должен выслать СМС/код в личку
             await phone_input.press("Enter")
+            logging.info("Веб-форма: номер отправлен, ждём экран ввода кода")
 
             # === ЭТАП ВВОДА КОДА ===
 
             # 1) Ждём, пока на вебе появится форма ввода кода
-            code_input = await find_first_visible(
-                CODE_INPUT_SELECTORS,
-                timeout=max(15_000, code_timeout * 1000),
-            )
+            try:
+                code_input = await find_first_visible(
+                    CODE_INPUT_SELECTORS,
+                    timeout=max(15_000, code_timeout * 1000),
+                )
+                logging.info("Поле ввода кода найдено")
+            except Exception:
+                logging.error("Не удалось найти поле ввода кода, прерываем авторизацию")
+                raise
 
             # 2) Запускаем ожидание кода ОТДЕЛЬНО, уже после перехода на экран ввода
             #    и с небольшой задержкой, чтобы успел прийти НОВЫЙ код
             initial_delay = 2.0  # можешь подкрутить при желании
+
+            logging.info(
+                "Ожидание кода авторизации (since_id=%s, timeout=%ss)",
+                baseline_msg_id,
+                code_timeout,
+            )
 
             code_task = asyncio.create_task(
                 wait_for_login_code(
@@ -1553,6 +1591,7 @@ async def run_web_login_flow(
 
             # 3) Забираем код и вводим его в форму
             code = await code_task
+            logging.info("Получен код авторизации: %s", code)
             await code_input.fill(code)
             await code_input.press("Enter")
             logging.info("Код авторизации введён в браузер")
