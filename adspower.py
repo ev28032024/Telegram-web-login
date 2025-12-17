@@ -278,6 +278,7 @@ def stop_adspower_profile(base_url: str, profile_id: str) -> None:
 def get_profile_by_serial_number(base_url: str, serial_number: str) -> Optional[str]:
     """
     Получает user_id профиля по его serial_number через API AdsPower.
+    Встроена защита от rate limit (retry).
     
     Args:
         base_url: Базовый URL AdsPower API
@@ -286,38 +287,60 @@ def get_profile_by_serial_number(base_url: str, serial_number: str) -> Optional[
     Returns:
         user_id профиля или None если не найден
     """
-    try:
-        data = _call_adspower_api(
-            base_url,
-            "/api/v1/user/list",
-            {"serial_number": serial_number},
-        )
-        
-        # API возвращает список профилей
-        profiles_list = data.get("list", [])
-        if not profiles_list:
-            logging.warning("Профиль с serial_number=%s не найден", serial_number)
-            return None
-        
-        # Берём первый найденный профиль
-        profile_data = profiles_list[0]
-        user_id = profile_data.get("user_id")
-        
-        if user_id:
-            logging.debug(
-                "Найден профиль: serial_number=%s -> user_id=%s", 
-                serial_number, user_id
+    max_retries = 3
+    retry_delay = 2.0
+    
+    for attempt in range(max_retries):
+        try:
+            data = _call_adspower_api(
+                base_url,
+                "/api/v1/user/list",
+                {"serial_number": serial_number},
             )
-            return user_id
-        
-        return None
-        
-    except Exception as exc:
-        logging.error(
-            "Ошибка получения профиля по serial_number=%s: %s", 
-            serial_number, exc
-        )
-        return None
+            
+            profiles_list = data.get("list", [])
+            if not profiles_list:
+                logging.warning("Профиль с serial_number=%s не найден", serial_number)
+                return None
+            
+            profile_data = profiles_list[0]
+            user_id = profile_data.get("user_id")
+            
+            if user_id:
+                logging.debug(
+                    "Найден профиль: serial_number=%s -> user_id=%s", 
+                    serial_number, user_id
+                )
+                return user_id
+            
+            return None
+            
+        except RuntimeError as exc:
+            # Проверяем ошибку rate limit
+            error_msg = str(exc).lower()
+            if "too many request" in error_msg and attempt < max_retries - 1:
+                logging.warning(
+                    "AdsPower API rate limit (serial=%s), повтор через %.1f сек...", 
+                    serial_number, retry_delay
+                )
+                time.sleep(retry_delay)
+                retry_delay *= 2  # Exponential backoff
+                continue
+            
+            # Если другая ошибка или кончились попытки
+            logging.error(
+                "Ошибка получения профиля по serial_number=%s: %s", 
+                serial_number, exc
+            )
+            return None
+            
+        except Exception as exc:
+            logging.error(
+                "Неожиданная ошибка при поиске профиля serial=%s: %s", 
+                serial_number, exc
+            )
+            return None
+    return None
 
 
 def resolve_profiles_user_ids(
@@ -335,12 +358,17 @@ def resolve_profiles_user_ids(
         Список профилей с заполненными user_id
     """
     resolved = []
+    total = len(profiles)
     
-    for config in profiles:
+    logging.info("Начинаем разрешение user_id для %d профилей...", total)
+    
+    for idx, config in enumerate(profiles, start=1):
         if config.user_id:
-            # user_id уже задан
             resolved.append(config)
             continue
+        
+        # Добавляем небольшую задержку перед каждым запросом, чтобы не спамить API
+        time.sleep(1.2)
         
         user_id = get_profile_by_serial_number(base_url, config.serial_number)
         if user_id:
@@ -348,12 +376,15 @@ def resolve_profiles_user_ids(
             resolved.append(config)
         else:
             logging.warning(
-                "Пропущен профиль serial_number=%s: не найден в AdsPower",
+                "Пропущен профиль serial_number=%s: не найден в AdsPower или ошибка API",
                 config.serial_number
             )
+            
+        if idx % 10 == 0:
+            logging.info("Обработано %d/%d профилей...", idx, total)
     
     logging.info(
-        "Разрешено %d/%d профилей", len(resolved), len(profiles)
+        "Разрешено %d/%d профилей", len(resolved), total
     )
     return resolved
 

@@ -2271,17 +2271,24 @@ def build_parser(
         help="Путь к файлу с профилями (CSV/JSON) для пакетной обработки. Формат: serial_number,two_fa",
     )
     
-    # API credentials - обязательны
+    # API credentials - опциональны в CLI, если есть в конфиге
     adspower_parser.add_argument(
         "--api-id", 
         type=int,
-        required=True,
-        help="api_id для Telethon"
+        required=False,
+        help="api_id для Telethon (если не указан, берётся из config/api_keys.json)"
     )
     adspower_parser.add_argument(
         "--api-hash",
-        required=True,
-        help="api_hash для Telethon"
+        required=False,
+        help="api_hash для Telethon (если не указан, берётся из config/api_keys.json)"
+    )
+    
+    # ПУТЬ к файлу ключей (если не передан явно)
+    adspower_parser.add_argument(
+        "--apis",
+        default=_config_str("check", check_cfg, "apis", "./config/api_keys.json"),
+        help="Путь к JSON файлу с API ключами (если не указаны --api-id/--api-hash)",
     )
     
     # Профиль AdsPower (для одиночного режима - когда --profiles не указан)
@@ -2403,6 +2410,25 @@ async def handle_adspower_login(args: argparse.Namespace) -> int:
     if not check_adspower_status(base_url):
         logging.error("AdsPower API недоступен по адресу: %s", base_url)
         return 1
+        
+    # Попытка подгрузить API ключи, если не переданы
+    if not args.api_id or not args.api_hash:
+        try:
+            api_path = Path(args.apis).expanduser() if args.apis else Path("config/api_keys.json")
+            if api_path.exists():
+                pairs = load_api_pairs(str(api_path))
+                if pairs:
+                    # Берём первый ключ
+                    args.api_id = pairs[0].api_id
+                    args.api_hash = pairs[0].api_hash
+                    logging.info("Используем credentials из файла: app_id=%s ...", args.api_id)
+        except Exception as exc:
+            logging.warning("Не удалось автоматически подгрузить API ключи: %s", exc)
+            
+    # Если всё ещё нет ключей - ошибка
+    if not args.api_id or not args.api_hash:
+         logging.error("Не указаны --api-id и --api-hash, и не удалось загрузить их из файла")
+         return 1
 
     # Определяем режим работы: одиночный имеет приоритет (если явно указан profile-id)
     if args.profile_id:
