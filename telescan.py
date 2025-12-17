@@ -2553,7 +2553,15 @@ async def handle_adspower_batch(args: argparse.Namespace, base_url: str) -> int:
     
     if session_arg.is_dir():
         # Если папка - собираем все .session файлы
-        sessions = sorted(list(session_arg.glob("*.session")))
+        found_sessions = list(session_arg.glob("*.session"))
+        
+        # Натуральная сортировка (1, 2, 10, а не 1, 10, 2)
+        def natural_key(path: Path):
+            return [int(text) if text.isdigit() else text.lower()
+                    for text in re.split(r'(\d+)', path.name)]
+            
+        sessions = sorted(found_sessions, key=natural_key)
+        
         if not sessions:
             logging.error("В папке %s не найдено .session файлов", session_arg)
             return 1
