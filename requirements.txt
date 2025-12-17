@@ -1,0 +1,6 @@
+telethon
+opentele
+tqdm
+pysocks
+playwright
+tomli; python_version < "3.11"

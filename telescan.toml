@@ -4,7 +4,7 @@
 
 [logging]
 # Уровень логирования для консоли. Возможные значения: CRITICAL, ERROR, WARNING, INFO, DEBUG.
-level = "INFO"
+level = "DEBUG"
 
 [check]
 # Путь к JSON файлу с Telethon API ключами (api_id/api_hash).
@@ -52,3 +52,19 @@ parallel = 4
 keep_temp = false
 # Путь к JSON файлу с Telethon API ключами (обязателен для режима session→tdata).
 apis = "./config/api_keys.json"
+
+[adspower]
+# Базовый URL API AdsPower
+base_url = "http://local.adspower.net:50325"
+# Путь к файлу с профилями (CSV или JSON) для пакетной обработки
+profiles = "./config/profiles.csv"
+# Максимальное количество одновременных профилей (1-5)
+concurrency = 1
+# Задержка между запуском профилей (сек)
+delay_between = 5.0
+# Таймаут ожидания кода входа от Telegram (сек)
+code_timeout = 30
+# Интервал опроса сообщений от Telegram (сек)
+poll_interval = 1.0
+# Таймаут подключения к Telegram (сек)
+connect_timeout = 20

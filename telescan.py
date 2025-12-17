@@ -42,35 +42,79 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlparse
 from urllib.request import urlopen
 
+# Import adspower module for multi-profile support
+from adspower import (
+    AdsPowerProfile,
+    AdsPowerProfileConfig,
+    BatchResult,
+    BatchSummary,
+    load_profiles,
+    process_profiles_batch,
+    save_batch_report,
+    start_adspower_profile,
+    stop_adspower_profile,
+    check_adspower_status,
+    resolve_profiles_user_ids,
+    normalize_phone,
+    LOGIN_BY_PHONE_SELECTORS,
+    PHONE_INPUT_SELECTORS,
+    CODE_INPUT_SELECTORS,
+    PASSWORD_INPUT_SELECTORS,
+)
+
+
+# Optional dependencies flags
+TELETHON_AVAILABLE = False
+TQDM_AVAILABLE = False
+OPENTELE_AVAILABLE = False
+PLAYWRIGHT_AVAILABLE = False
+SOCKS_AVAILABLE = False
+
 try:
     from telethon import TelegramClient, events
     from telethon.errors import FloodWaitError, RPCError, SessionPasswordNeededError
     from telethon.sessions import StringSession
-except ImportError as exc:  # pragma: no cover - критическая ошибка конфигурации окружения
-    raise SystemExit(
-        "[ERROR] Требуется установить telethon: pip install telethon"
-    ) from exc
+    TELETHON_AVAILABLE = True
+except ImportError:
+    # Define dummy classes for type hinting/runtime safety if missing
+    TelegramClient = Any  # type: ignore
+    StringSession = Any  # type: ignore
+    events = Any  # type: ignore
+    FloodWaitError = RPCError = SessionPasswordNeededError = Exception  # type: ignore
 
-try:  # pragma: no cover - опциональная зависимость
+try:
     from tqdm.asyncio import tqdm
-except ImportError as exc:
-    raise SystemExit("[ERROR] Требуется установить tqdm: pip install tqdm") from exc
+    TQDM_AVAILABLE = True
+except ImportError:
+    # Fallback to simple iterator
+    def tqdm(iterable, *args, **kwargs):
+        return iterable
 
-_playwright_spec = importlib.util.find_spec("playwright.async_api")
-if _playwright_spec:  # pragma: no cover - опциональная зависимость
+
+try:
+    _playwright_spec = importlib.util.find_spec("playwright.async_api")
+except (ImportError, AttributeError, ValueError):
+    _playwright_spec = None
+
+if _playwright_spec:
     async_playwright = importlib.import_module("playwright.async_api").async_playwright
-else:  # pragma: no cover - зависимость по требованию
+    PLAYWRIGHT_AVAILABLE = True
+else:
     async_playwright = None
+    PLAYWRIGHT_AVAILABLE = False
 
-try:  # pragma: no cover - опциональная зависимость
+
+
+
+try:
     from opentele.api import UseCurrentSession
     from opentele.exception import OpenTeleException, TFileNotFound
     from opentele.td import TDesktop
-
     OPENTELE_AVAILABLE = True
 except ImportError:
     OpenTeleException = TFileNotFound = None  # type: ignore
     OPENTELE_AVAILABLE = False
+
 
 
 if OPENTELE_AVAILABLE:
@@ -250,13 +294,17 @@ def apply_logging_config(config: Dict[str, Any]) -> None:
     logging.getLogger().setLevel(level_value)
 
 
-try:  # pragma: no cover - опциональная зависимость
+
+try:
     import socks
-except ImportError:  # pragma: no cover
+    SOCKS_AVAILABLE = True
+except ImportError:
     socks = None
+    SOCKS_AVAILABLE = False
     logging.warning(
         "[WARNING] PySocks не установлен. Поддержка прокси будет недоступна."
     )
+
 
 
 # ---------------------------------------------------------------------------
@@ -343,9 +391,34 @@ class AdsPowerProfile:
     browser_pid: Optional[int]
 
 
+
+def check_environment(feature: str) -> None:
+    """Проверяет наличие необходимых зависимостей для конкретной функции."""
+    
+    missing = []
+    if feature == "telethon" and not TELETHON_AVAILABLE:
+        missing.append("telethon")
+    elif feature == "tdata" and (not OPENTELE_AVAILABLE or not TELETHON_AVAILABLE):
+        if not TELETHON_AVAILABLE: missing.append("telethon")
+        if not OPENTELE_AVAILABLE: missing.append("opentele")
+    elif feature == "adspower" and not PLAYWRIGHT_AVAILABLE:
+        missing.append("playwright")
+    elif feature == "proxy" and not SOCKS_AVAILABLE:
+        missing.append("pysocks")
+    elif feature == "tqdm" and not TQDM_AVAILABLE:
+        missing.append("tqdm")
+
+    if missing:
+        msg = f"[ERROR] Для функции '{feature}' требуются библиотеки: {', '.join(missing)}.\n"
+        msg += f"Установите их командой: pip install {' '.join(missing)}"
+        logging.error(msg)
+        sys.exit(1)
+
+
 # ---------------------------------------------------------------------------
 # Helpers: API, proxies, filesystem
 # ---------------------------------------------------------------------------
+
 
 
 def load_api_pairs(path: str) -> List[ApiPair]:
@@ -445,6 +518,29 @@ def require_playwright() -> None:
         raise SystemExit(
             "[ERROR] Требуется установить playwright: pip install playwright && playwright install chromium"
         )
+
+
+ADSPOWER_API_TIMEOUT = 5.0
+
+
+def check_adspower_status(base_url: str) -> bool:
+    """Проверяет доступность API AdsPower."""
+    url = f"{base_url.rstrip('/')}/status"
+    try:
+        with urlopen(url, timeout=ADSPOWER_API_TIMEOUT) as response:
+            if response.status == 200:
+                return True
+    except Exception:
+        pass
+    
+    # Fallback to /api/v1/browser/active or similar simple endpoint if status doesn't exist
+    # Or just check root, but AdsPower usually has specific status endpoints.
+    # Let's try a simple connection to base_url as a backup
+    try:
+        with urlopen(base_url, timeout=ADSPOWER_API_TIMEOUT) as response:
+             return True
+    except Exception:
+        return False
 
 
 def _call_adspower_api(base_url: str, path: str, params: Dict[str, str]) -> Dict[str, Any]:
@@ -1154,148 +1250,133 @@ async def wait_for_login_code(
     initial_delay: float = 2.0,
     telegram_peer: Optional[Any] = None,
 ) -> str:
-    """Возвращает код авторизации из чата 777000 с приоритетом свежих сообщений."""
+    """Возвращает код авторизации из истории сообщений.
+    
+    Логика:
+    1. Проверяем историю. Если есть код с msg_id > since_id -> возвращаем сразу.
+    2. Если нет свежего, но есть любой код -> запоминаем как fallback.
+    3. Слушаем новые сообщения (и поллим историю). Если приходит > since_id -> возвращаем.
+    4. Если timeout истек и ничего нового нет -> возвращаем fallback.
+    """
 
     logging.info(
-        "Ожидаем код входа от Telegram (since_id=%s, timeout=%ss, poll=%.2fs)",
+        "Ожидаем код входа (since_id=%s, timeout=%ss)",
         since_id,
         timeout,
-        poll_interval,
     )
 
     deadline = time.monotonic() + timeout
     last_id = since_id or 0
     fallback_code: Optional[str] = None
 
-    peer = telegram_peer or await resolve_telegram_peer(client)
-    entity = await client.get_entity(peer)
-    target_user_id = getattr(entity, "id", None)
-    if target_user_id is None:
-        logging.warning(
-            "Не удалось определить user_id для официального чата Telegram, "
-            "будем принимать любой входящий код",
-        )
+    # Попытка определить пир (для get_messages), но слушаем всё равно всё
+    peer = telegram_peer 
+    if not peer:
+         try:
+             peer = await resolve_telegram_peer(client)
+         except Exception:
+             peer = None
 
-    # 1) Сразу читаем историю, чтобы моментально вернуть свежий код (msg_id > since_id)
+    # --- 1. Проверяем историю прямо сейчас ---
     try:
-        history = await client.get_messages(peer, limit=30)
-    except Exception as exc:  # pragma: no cover - диагностический лог
-        logging.debug("Не удалось прочитать историю чата с Telegram: %s", exc)
+        # Если peer известен, читаем из него. Если нет — общий dialogs (дольше / опаснее), 
+        # поэтому лучше всё же peer. Обычно это 777000.
+        if peer:
+             history = await client.get_messages(peer, limit=20)
+        else:
+             history = []
+    except Exception as exc:
+        logging.debug("Ошибка чтения истории: %s", exc)
         history = []
 
     for msg in history:
-        if getattr(msg, "out", False):
-            continue
-
         text = (msg.message or "").strip()
-        if not text:
+        if not text: 
             continue
-
+            
         code = _extract_login_code(text, min_len=min_len, max_len=max_len)
         if not code:
             continue
+            
+        logging.debug(f"Найден код в истории (id={msg.id}): {code}")
 
         if msg.id > since_id:
-            logging.info(
-                "Найден свежий код от Telegram (msg_id=%s > since_id=%s), возвращаем сразу",
-                msg.id,
-                since_id,
-            )
+            logging.info("Найден свежий код в истории! (%s > %s) -> %s", msg.id, since_id, code)
             return code
-
+        
+        # Запоминаем самый последний из старых (history обычно сортирована от новых к старым)
         if fallback_code is None:
             fallback_code = code
-            logging.info(
-                "Сохраняем резервный код из истории (msg_id=%s): %s",
-                msg.id,
-                code,
-            )
 
+    if fallback_code:
+        logging.info("Найден резервный (старый) код: %s. Ждём новый код %.1f сек...", fallback_code, timeout)
+
+    # --- 2. Слушаем новые сообщения и поллим (параллельно) ---
+    
     loop = asyncio.get_running_loop()
     push_code: "asyncio.Future[str]" = loop.create_future()
 
-    def _handle_candidate(msg_id: int, text: str) -> Optional[str]:
-        nonlocal last_id
-
-        if msg_id <= last_id:
-            return None
-
-        code_candidate = _extract_login_code(text, min_len=min_len, max_len=max_len)
-        if not code_candidate:
-            return None
-
-        last_id = msg_id
-        return code_candidate
-
+    # Листнер (мгновенная реакция)
     @client.on(events.NewMessage(incoming=True))
-    async def _on_new_message(event: events.NewMessage.Event) -> None:  # type: ignore[name-defined]
+    async def _on_new_message(event: events.NewMessage.Event) -> None:
         if push_code.done():
             return
-
+            
         msg = event.message
-        sender_id = getattr(msg.peer_id, "user_id", None) or getattr(
-            msg, "sender_id", None
-        )
-
-        if target_user_id and sender_id != target_user_id:
-            return
-
         text = (msg.message or "").strip()
         if not text:
             return
 
-        code_candidate = _handle_candidate(msg.id, text)
-        if code_candidate:
-            logging.info(
-                "Получен НОВЫЙ код от Telegram (msg_id=%s): %s",
-                msg.id,
-                code_candidate,
-            )
-            push_code.set_result(code_candidate)
+        code = _extract_login_code(text, min_len=min_len, max_len=max_len)
+        if code:
+             logging.info("Пришло сообщение с кодом (id=%s): %s", msg.id, code)
+             if not push_code.done():
+                 push_code.set_result(code)
 
-    if initial_delay > 0:
-        await asyncio.sleep(initial_delay)
+    # Фоновая задача поллинга (на случай если ивент потерялся или API тупит)
+    async def _poller():
+        while True:
+            await asyncio.sleep(poll_interval)
+            if push_code.done():
+                break
+            
+            if peer:
+                try:
+                    msgs = await client.get_messages(peer, limit=5)
+                    for msg in msgs:
+                        if msg.id <= since_id: continue
+                        text = (msg.message or "").strip()
+                        c = _extract_login_code(text, min_len, max_len)
+                        if c:
+                             logging.info("Поллинг обнаружил код (id=%s): %s", msg.id, c)
+                             if not push_code.done():
+                                 push_code.set_result(c)
+                             return
+                except Exception:
+                     pass
+
+    poller_task = asyncio.create_task(_poller())
 
     try:
-        while time.monotonic() < deadline:
-            msgs = await client.get_messages(peer, limit=30)
+        # Ждём результат или таймаут. 
+        # Если push_code засетится листнером, мы выйдем МГНОВЕННО.
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            remaining = 0.1
+            
+        return await asyncio.wait_for(push_code, timeout=remaining)
 
-            for msg in msgs:
-                if getattr(msg, "out", False):
-                    continue
-
-                text = (msg.message or "").strip()
-                if not text:
-                    continue
-
-                code_candidate = _handle_candidate(msg.id, text)
-                if code_candidate:
-                    logging.info(
-                        "Получен НОВЫЙ код от Telegram (msg_id=%s): %s",
-                        msg.id,
-                        code_candidate,
-                    )
-                    return code_candidate
-
-            if push_code.done():
-                return await push_code
-
-            await asyncio.sleep(max(0.2, poll_interval))
-
-        if push_code.done():
-            return await push_code
-
+    except asyncio.TimeoutError:
         if fallback_code:
-            logging.warning(
-                "Новый код не пришёл за %s секунд, используем резерв: %s",
-                timeout,
-                fallback_code,
-            )
+            logging.warning("Таймаут ожидания нового кода! Используем резервный код: %s", fallback_code)
             return fallback_code
-
-        raise TimeoutError("Не удалось дождаться кода авторизации от Telegram")
+        raise TimeoutError("Код авторизации так и не пришел за отведенное время.")
+        
     finally:
         client.remove_event_handler(_on_new_message)
+        poller_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await poller_task
 
 async def run_web_login_flow(
     client: TelegramClient,
@@ -1317,282 +1398,331 @@ async def run_web_login_flow(
 
     # --- селекторы ---
     LOGIN_BY_PHONE_SELECTORS: Sequence[str] = [
-        # англ.
-        "button:has-text('phone number')",
+        # prioritized user selector
         "button:has-text('Log in by phone Number')",
+        # fallback
+        "button:has-text('phone number')",
         "button:has-text('Log in by phone number')",
-        "button:has-text('Log in with phone number')",
         "text=/Log in by phone/i",
-        # рус.
         "button:has-text('Войти по номеру телефона')",
-        "button:has-text('По номеру телефона')",
-        "button:has-text('Номер телефона')",
         "text=/Войти по номеру телефона/i",
-        "text=/по номеру телефона/i",
-        "text=/телефон/i",
     ]
 
     PHONE_INPUT_SELECTORS: Sequence[str] = [
-        # твой конкретный HTML
-        ".input-field-phone .input-field-input[contenteditable='true']",
-        ".input-field-phone [contenteditable='true']",
-        "div.input-field.input-field-phone div[contenteditable='true']",
-        "div.input-field-input[contenteditable='true'][inputmode='decimal']",
-        # обычные input’ы
+        # user specific
         "#sign-in-phone-number",
-        "input[name='phone_number']",
-        "input[inputmode='tel']",
-        "input[type='tel']",
-        "input[autocomplete='tel']",
-        "input[autocomplete='tel-national']",
-        "input[placeholder*='phone' i]",
-        "input[placeholder*='number' i]",
-        "input[placeholder*='телефон' i]",
-        "input[id*='phone' i]",
-        "input[name*='phone' i]",
-        "input[data-testid='login-phone-input']",
         "input[data-testid='phone-number-input']",
-        "input[data-testid='phone-input']",
+        ".input-field-phone .input-field-input[contenteditable='true']",
+        "input[name='phone_number']",
+        "input[type='tel']",
     ]
 
     # селекторы для поля КОДА
     CODE_INPUT_SELECTORS: Sequence[str] = [
-        # типичные варианты Telegram
+        # user specific
+        "#sign-in-code",
         "input[autocomplete='one-time-code']",
         "input[name*='code' i]",
-        "input[placeholder*='code' i]",
-        "input[placeholder*='код' i]",
-
-        # любые цифровые input'ы
-        "input[inputmode='numeric']",
-        "input[inputmode='decimal']",
-        "input[type='tel']",
-
-        # contenteditable (в стиле твоих полей)
         ".input-field-input[contenteditable='true'][inputmode='numeric']",
-        ".input-field-input[contenteditable='true'][inputmode='decimal']",
-        ".input-field-input[contenteditable='true']",
-        "div[contenteditable='true'][inputmode='numeric']",
-        "div[contenteditable='true'][inputmode='decimal']",
+        "input[inputmode='numeric']",
     ]
 
     PASSWORD_INPUT_SELECTORS: Sequence[str] = [
-        # стандартные инпуты
         "input[type='password']",
-        "input[name='password']",
-        "input[autocomplete='current-password']",
-        "input[id*='password' i]",
         "#sign-in-password",
-
-        # contenteditable варианты
         "div[contenteditable='true'][data-password='true']",
-        "div.input-field-input[contenteditable='true']",
     ]
 
     async def find_first_visible(selectors: Sequence[str], timeout: int = 20_000):
         # Поиск на странице и во фреймах
-        search_contexts = [page, *page.frames]
+        start = time.monotonic()
+        deadline = start + (timeout / 1000.0)
 
-        for selector in selectors:
-            for context in search_contexts:
-                locator = context.locator(selector).first
-                try:
-                    await locator.wait_for(state="visible", timeout=timeout)
-                    logging.debug("Найден элемент по селектору: %s", selector)
-                    return locator
-                except Exception:
-                    continue
+        while True:
+            # Обновляем список фреймов на каждой итерации
+            search_contexts = [page, *page.frames]
+            
+            for selector in selectors:
+                for context in search_contexts:
+                    locator = context.locator(selector).first
+                    try:
+                        if await locator.is_visible():
+                            logging.debug("Найден элемент по селектору: %s", selector)
+                            return locator
+                        else:
+                            # Для отладки: элемент в DOM есть, но не visible
+                            if await locator.count() > 0:
+                                 logging.debug("Элемент есть в DOM, но не visible: %s", selector)
+                    except Exception:
+                        continue
+
+            if time.monotonic() >= deadline:
+                break
+            
+            await asyncio.sleep(0.5)
 
         raise TimeoutError(
             "Не удалось найти видимый элемент среди: " + ", ".join(selectors)
         )
 
     async def click_first_visible(selectors: Sequence[str], timeout: int = 5_000) -> bool:
-        search_contexts = [page, *page.frames]
+        start = time.monotonic()
+        deadline = start + (timeout / 1000.0)
 
-        for selector in selectors:
-            for context in search_contexts:
-                locator = context.locator(selector).first
-                try:
-                    await locator.wait_for(state="visible", timeout=timeout)
-                    await locator.click()
-                    logging.debug("Клик по селектору: %s", selector)
-                    return True
-                except Exception:
-                    continue
+        while True:
+            search_contexts = [page, *page.frames]
+
+            for selector in selectors:
+                for context in search_contexts:
+                    locator = context.locator(selector).first
+                    try:
+                        if await locator.is_visible():
+                            await locator.click()
+                            logging.debug("Клик по селектору: %s", selector)
+                            return True
+                    except Exception:
+                        continue
+            
+            if time.monotonic() >= deadline:
+                break
+
+            await asyncio.sleep(0.5)
 
         return False
 
     async def click_login_by_phone_if_present(timeout: int = 3_000) -> bool:
         """Ищет кнопку входа по номеру телефона и кликает по ней при наличии."""
-
         if not LOGIN_BY_PHONE_SELECTORS:
             return False
 
-        search_contexts = [page, *page.frames]
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout / 1000
+        try:
+            # Short check for the button
+            return await click_first_visible(LOGIN_BY_PHONE_SELECTORS, timeout=timeout)
+        except Exception:
+            return False
 
-        for selector in LOGIN_BY_PHONE_SELECTORS:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                break
+    async def check_active_session(target_phone: str) -> Optional[bool]:
+        """
+        Проверяет, авторизован ли аккаунт и совпадает ли номер.
+        Возвращает:
+           True  - авторизован и номер совпадает
+           False - авторизован, но номер ДРУГОЙ
+           None  - не авторизован (или меню не найдено)
+        """
+        try:
+            # 1. Ищем кнопку меню (гамбургер)
+            menu_btn = await find_first_visible([".btn-menu-toggle"], timeout=5000)
+            logging.info("Меню найдено - аккаунт уже авторизован.")
+            
+            # Открываем меню
+            await menu_btn.click()
+            await asyncio.sleep(1.0) # wait animation
 
-            for context in search_contexts:
-                remaining_ms = max(1, int((deadline - loop.time()) * 1000))
-                if remaining_ms <= 0:
-                    break
-
-                locator = context.locator(selector).first
-                try:
-                    await locator.wait_for(state="visible", timeout=remaining_ms)
-                except Exception:
-                    continue
-
-                try:
-                    await locator.click()
-                    logging.info(
-                        "Обнаружена кнопка входа по номеру телефона, выполняем клик"
-                    )
-                    return True
-                except Exception as exc:
-                    logging.debug(
-                        "Не удалось кликнуть по кнопке %s: %s", selector, exc
-                    )
-
-        return False
+            # 2. Ищем кнопку профиля
+            profile_btn = await find_first_visible([".btn-menu-item:has(.btn-menu-item-avatar.active)"], timeout=5000)
+            await profile_btn.click()
+            await asyncio.sleep(1.0)
+            
+            # 3. Ищем телефон
+            phone_el = page.locator(".row-with-icon:has(.row-subtitle >> text='Phone') .row-title").first
+            current_phone = await phone_el.inner_text()
+            
+            def norm(p): return re.sub(r"\D", "", p)
+            
+            logging.info(f"Текущий телефон в сессии: {current_phone}, Целевой: {target_phone}")
+            
+            if norm(current_phone) == norm(target_phone):
+                logging.info("Номера совпадают! Авторизация не требуется.")
+                return True
+            else:
+                logging.warning("Номера НЕ совпадают!")
+                return False
+                
+        except Exception:
+            return None
 
     try:
         async with async_playwright() as playwright:
             browser = await playwright.chromium.connect_over_cdp(profile.ws_endpoint)
-            context = browser.contexts[0] if browser.contexts else await browser.new_context()
-            page = context.pages[0] if context.pages else await context.new_page()
-
-            await page.goto("https://web.telegram.org/k/", wait_until="domcontentloaded")
-            await page.wait_for_timeout(1500)
-
-            login_button_clicked = await click_login_by_phone_if_present(timeout=6_000)
-            if login_button_clicked:
-                logging.debug(
-                    "Кнопка входа по номеру найдена и нажата перед поиском поля телефона"
-                )
-
-            # 1. Пытаемся сразу найти поле телефона
             try:
-                phone_input = await find_first_visible(
-                    PHONE_INPUT_SELECTORS,
-                    timeout=8_000,
-                )
-            except TimeoutError:
-                # 2. Если не нашли — жмём "Log in by phone"
-                clicked = await click_login_by_phone_if_present(timeout=10_000)
-                if not clicked:
-                    logging.warning(
-                        "Не удалось автоматически нажать кнопку входа по номеру телефона, "
-                        "пробуем ещё раз найти поле ввода напрямую"
+                context = browser.contexts[0] if browser.contexts else await browser.new_context()
+                page = context.pages[0] if context.pages else await context.new_page()
+
+                await page.goto("https://web.telegram.org/k/", wait_until="domcontentloaded")
+                await page.wait_for_timeout(1500)
+
+                # 0. Check for "Log in by phone Number" button
+                await click_login_by_phone_if_present(timeout=5_000)
+
+                # --- НАЧАЛО ЛОГИКИ ВХОДА ---
+                
+                # 1. Проверка текущей сессии
+                logging.info(f"Проверка текущей сессии для номера {phone_normalized}...")
+                
+                session_status = await check_active_session(phone_normalized)
+                
+                if session_status is True:
+                     logging.info("Аккаунт уже авторизован с нужным номером. Завершаем работу успешно.")
+                     await browser.close()
+                     return 0
+                
+                # 2. Если чужой аккаунт или непонятное состояние (stuck)
+                is_start_screen = False
+                if session_status is None:
+                    try:
+                        await find_first_visible(LOGIN_BY_PHONE_SELECTORS, timeout=3000)
+                        is_start_screen = True
+                    except Exception:
+                        pass
+
+                if session_status is False or (session_status is None and not is_start_screen):
+                    logging.warning("Обнаружен чужой аккаунт или промежуточное состояние. Очищаем сессию...")
+                    context = page.context
+                    await context.clear_cookies()
+                    await page.evaluate("localStorage.clear(); sessionStorage.clear();")
+                    logging.info("Перезагрузка страницы...")
+                    await page.reload()
+                    await page.wait_for_timeout(3000)
+                    
+                    # После перезагрузки снова попробуем нажать кнопку входа
+                    await click_login_by_phone_if_present(timeout=5_000)
+
+                # 3. Ввод телефона (Старт)
+                try:
+                    # Попытка найти поле. Если не найдено - пробуем кликнуть кнопку еще раз
+                    try:
+                        phone_input = await find_first_visible(
+                            PHONE_INPUT_SELECTORS,
+                            timeout=5_000,
+                        )
+                    except Exception:
+                        clicked = await click_login_by_phone_if_present(timeout=5_000)
+                        if not clicked:
+                            logging.warning("Поле ввода телефона не найдено сразу.")
+                        
+                        phone_input = await find_first_visible(
+                            PHONE_INPUT_SELECTORS,
+                            timeout=10_000,
+                        )
+
+                except Exception:
+                     logging.error("Не удалось найти поле ввода телефона.")
+                     raise
+
+                logging.info("Веб-форма: вводим номер телефона")
+                await phone_input.click()
+
+                # Агрессивно очищаем поле перед вводом (как было раньше)
+                with contextlib.suppress(Exception):
+                    await phone_input.press("Control+A")
+                    await phone_input.press("Backspace")
+                    await phone_input.press("Delete")
+
+                with contextlib.suppress(Exception):
+                    await phone_input.fill("")
+
+                with contextlib.suppress(Exception):
+                    await phone_input.evaluate(
+                        "el => {"
+                        " if ('value' in el) el.value = '';"
+                        " el.innerText = '';"
+                        " el.textContent = '';"
+                        " }"
                     )
 
-                # 3. После клика ищем поле ещё раз
-                phone_input = await find_first_visible(
-                    PHONE_INPUT_SELECTORS,
-                    timeout=15_000,
+                await phone_input.type(phone_normalized, delay=50)
+                await page.wait_for_timeout(300)
+
+                # Кнопка NEXT
+                logging.info("Нажимаем кнопку Next")
+                # Try clicking "Next" button specifically
+                next_clicked = await click_first_visible(
+                    ["button:has-text('Next')", "button:has-text('Далее')"],
+                    timeout=3000
+                )
+                if not next_clicked:
+                     # Fallback to Enter
+                     logging.debug("Кнопка Next не найдена, жмём Enter")
+                     await phone_input.press("Enter")
+
+                logging.info("Веб-форма: номер отправлен, ждём экран ввода кода")
+
+                # === ЭТАП ВВОДА КОДА ===
+
+                # === ЭТАП ВВОДА КОДА ===
+                logging.info("Этап: Ожидание кода автоизации от Telegram API...")
+                
+                # Запускаем ожидание кода ОТДЕЛЬНО, чтобы он мог прийти пока мы ищем форму (или если уже пришел)
+                initial_delay = 2.0 
+                code_task = asyncio.create_task(
+                    wait_for_login_code(
+                        client=client,
+                        since_id=baseline_msg_id,
+                        timeout=code_timeout,
+                        poll_interval=poll_interval,
+                        min_len=5,
+                        max_len=6,
+                        initial_delay=initial_delay,
+                        telegram_peer=telegram_peer,
+                    )
                 )
 
-            # --- ВВОД ТЕЛЕФОНА ---
-            logging.info("Веб-форма: вводим номер телефона")
-
-            await phone_input.click()
-
-            # Агрессивно очищаем поле перед вводом
-            with contextlib.suppress(Exception):
-                await phone_input.press("Control+A")
-                await phone_input.press("Backspace")
-                await phone_input.press("Delete")
-
-            with contextlib.suppress(Exception):
-                await phone_input.fill("")
-
-            with contextlib.suppress(Exception):
-                await phone_input.evaluate(
-                    "el => {"
-                    " if ('value' in el) el.value = '';"
-                    " el.innerText = '';"
-                    " el.textContent = '';"
-                    " }"
-                )
-
-            await phone_input.type(phone_normalized, delay=50)
-            await page.wait_for_timeout(300)
-
-            # Отправляем номер — Telegram должен выслать СМС/код в личку
-            await phone_input.press("Enter")
-            logging.info("Веб-форма: номер отправлен, ждём экран ввода кода")
-
-            # === ЭТАП ВВОДА КОДА ===
-
-            # 1) Ждём, пока на вебе появится форма ввода кода
-            try:
-                code_input = await find_first_visible(
-                    CODE_INPUT_SELECTORS,
-                    timeout=max(15_000, code_timeout * 1000),
-                )
-                logging.info("Поле ввода кода найдено")
-            except Exception:
-                logging.error("Не удалось найти поле ввода кода, прерываем авторизацию")
-                raise
-
-            # 2) Запускаем ожидание кода ОТДЕЛЬНО, уже после перехода на экран ввода
-            #    и с небольшой задержкой, чтобы успел прийти НОВЫЙ код
-            initial_delay = 2.0  # можешь подкрутить при желании
-
-            logging.info(
-                "Ожидание кода авторизации (since_id=%s, timeout=%ss)",
-                baseline_msg_id,
-                code_timeout,
-            )
-
-            code_task = asyncio.create_task(
-                wait_for_login_code(
-                    client=client,
-                    since_id=baseline_msg_id,
-                    timeout=code_timeout,
-                    poll_interval=poll_interval,
-                    min_len=5,
-                    max_len=6,
-                    initial_delay=initial_delay,
-                    telegram_peer=telegram_peer,
-                )
-            )
-
-            # 3) Забираем код и вводим его в форму
-            code = await code_task
-            logging.info("Получен код авторизации: %s", code)
-            await code_input.fill(code)
-            await code_input.press("Enter")
-            logging.info("Код авторизации введён в браузер")
-
-            # --- 2FA, если есть ---
-            if two_fa:
-                password_input = await find_first_visible(
-                    PASSWORD_INPUT_SELECTORS,
-                    timeout=60_000,
-                )
+                # 1) Ждём, пока пропадёт поле ввода телефона (признак смены страницы)
+                logging.info("Этап: Ожидание перехода на экран кода (исчезновение телефона)...")
                 try:
-                    await password_input.fill("")
+                    await phone_input.wait_for(state="hidden", timeout=15000)
+                    logging.info("Поле телефона исчезло - переход подтверждён.")
                 except Exception:
-                    with contextlib.suppress(Exception):
-                        await password_input.evaluate("el => { el.innerText = ''; el.textContent = ''; }")
-                try:
-                    await password_input.fill(two_fa)
-                except Exception:
-                    # На всякий случай имитируем ручной ввод (например, если блокируются .fill)
-                    await password_input.click()
-                    await password_input.type(two_fa, delay=80)
-                await password_input.press("Enter")
-                logging.info("Пароль 2FA введён")
+                    logging.warning("Таймаут ожидания скрытия телефона. Возможно, страница уже обновилась.")
 
-            await page.wait_for_timeout(1500)
-            await browser.close()
+                # Небольшой буфер для анимаций
+                await asyncio.sleep(2.0)
+
+                # 2) Ждем сам код
+                logging.info("Этап: Ожидание завершения получения кода...")
+                try:
+                    code = await code_task
+                    logging.info("Код от Telegram получен: %s", code)
+                except Exception as exc:
+                    logging.error("Не удалось получить код от Telegram: %s", exc)
+                    raise
+
+                # 3) Вводим код (ВСЛЕПУЮ)
+                logging.info("Этап: Ввод кода в браузер (вслепую)...")
+                # Мы предполагаем, что фокус уже стоит в поле.
+                # Если нет, можно попробовать кликнуть в центр экрана или page.keyboard.press("Tab")?
+                # Но обычно Telegram Web ставит фокус сам.
+                await page.keyboard.type(code)
+
+                logging.info("Код авторизации введён (или отправлен) в браузер")
+
+                # --- 2FA, если есть ---
+                if two_fa:
+                    logging.info("Этап: Ожидание экрана 2FA...")
+
+                    # 1. Ждем появления поля (чтобы понять что страница загрузилась), но НЕ трогаем его
+                    # (Пользователь сообщил, что клики/фокусы вешают скрипт. Просто ждем визуального наличия.)
+                    try:
+                         await find_first_visible(PASSWORD_INPUT_SELECTORS, timeout=60_000)
+                         logging.info("Экран 2FA обнаружен (поле найдено).")
+                    except Exception:
+                         logging.warning("Не нашли поле 2FA за 60с, но попробуем ввести пароль всё равно (страховка).")
+
+                    # 2. Небольшой буфер после появления (чтобы фокус встал)
+                    await asyncio.sleep(2.0)
+
+                    # 3. Ввод вслепую
+                    logging.info("Ввод 2FA пароля вслепую (без кликов/фокуса)...")
+                    await page.keyboard.type(two_fa, delay=50)
+                    await page.wait_for_timeout(300)
+                    await page.keyboard.press("Enter")
+                    
+                    logging.info("Пароль 2FA введён, нажат Enter")
+
+                await page.wait_for_timeout(1500)
+            finally:
+                await browser.close()
+
     finally:
         if code_task and not code_task.done():
             code_task.cancel()
@@ -2119,21 +2249,45 @@ def build_parser(
     )
 
     # --- ADSPOWER ---
+    adspower_cfg = _config_section(cfg, "adspower")
+    
     adspower_parser = subparsers.add_parser(
         "adspower-login",
-        help="Вход в web.telegram.org через профиль AdsPower",
+        help="Вход в web.telegram.org через профиль AdsPower (одиночный или пакетный режим)",
+        formatter_class=argparse.RawTextHelpFormatter,
     )
+    
+    # Session файл - обязателен для всех режимов
     adspower_parser.add_argument(
         "--session",
         required=True,
         help="Путь к Telethon .session файлу",
     )
-    adspower_parser.add_argument("--api-id", type=int, required=True, help="api_id для Telethon")
-    adspower_parser.add_argument("--api-hash", required=True, help="api_hash для Telethon")
+    
+    # Файл с профилями (если указан - пакетный режим)
+    adspower_parser.add_argument(
+        "--profiles",
+        default=_config_str("adspower", adspower_cfg, "profiles", None),
+        help="Путь к файлу с профилями (CSV/JSON) для пакетной обработки. Формат: serial_number,two_fa",
+    )
+    
+    # API credentials - обязательны
+    adspower_parser.add_argument(
+        "--api-id", 
+        type=int,
+        required=True,
+        help="api_id для Telethon"
+    )
+    adspower_parser.add_argument(
+        "--api-hash",
+        required=True,
+        help="api_hash для Telethon"
+    )
+    
+    # Профиль AdsPower (для одиночного режима - когда --profiles не указан)
     adspower_parser.add_argument(
         "--profile-id",
-        required=True,
-        help="user_id профиля в AdsPower",
+        help="user_id профиля в AdsPower (для одиночного режима, когда --profiles не указан)",
     )
     adspower_parser.add_argument(
         "--phone",
@@ -2143,29 +2297,53 @@ def build_parser(
         "--two-fa",
         help="Пароль двухфакторной аутентификации Telegram (если включён)",
     )
+    
+    # Настройки AdsPower API
     adspower_parser.add_argument(
         "--adspower-base",
-        default="http://local.adspower.net:50325",
+        default=_config_str("adspower", adspower_cfg, "base_url", "http://local.adspower.net:50325"),
         help="Базовый URL локального API AdsPower",
     )
+    
+    # Таймауты и интервалы
     adspower_parser.add_argument(
         "--code-timeout",
         type=int,
-        default=180,
+        default=_config_int("adspower", adspower_cfg, "code_timeout", 30),
         help="Таймаут ожидания кода входа от Telegram (сек)",
     )
     adspower_parser.add_argument(
         "--poll-interval",
         type=float,
-        default=1.0,
+        default=_config_float("adspower", adspower_cfg, "poll_interval", 1.0),
         help="Интервал опроса диалога с Telegram (сек)",
     )
     adspower_parser.add_argument(
         "--connect-timeout",
         type=int,
-        default=20,
+        default=_config_int("adspower", adspower_cfg, "connect_timeout", 20),
         help="Таймаут подключения к Telegram",
     )
+    
+    # Настройки пакетного режима
+    adspower_parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=_config_int("adspower", adspower_cfg, "concurrency", 1),
+        help="Количество одновременно обрабатываемых профилей (1-5, только для пакетного режима)",
+    )
+    adspower_parser.add_argument(
+        "--delay-between",
+        type=float,
+        default=_config_float("adspower", adspower_cfg, "delay_between", 5.0),
+        help="Задержка между профилями в сек (только для пакетного режима)",
+    )
+    adspower_parser.add_argument(
+        "--report",
+        default="./reports/adspower_batch_report.csv",
+        help="Путь к CSV отчёту о пакетной обработке",
+    )
+
 
     # --- CONVERT ---
     convert_parser = subparsers.add_parser(
@@ -2215,74 +2393,275 @@ def build_parser(
 
 
 async def handle_adspower_login(args: argparse.Namespace) -> int:
-    require_playwright()
+    """Обработчик команды adspower-login."""
+    
+    check_environment("telethon")
+    check_environment("adspower")
+    
+    base_url = args.adspower_base.rstrip("/")
+    
+    if not check_adspower_status(base_url):
+        logging.error("AdsPower API недоступен по адресу: %s", base_url)
+        return 1
 
+    # Определяем режим работы: одиночный имеет приоритет (если явно указан profile-id)
+    if args.profile_id:
+        return await handle_adspower_single(args, base_url)
+    elif args.profiles:
+        return await handle_adspower_batch(args, base_url)
+    else:
+        logging.error("Необходимо указать --profile-id (одиночный режим) или --profiles (пакетный режим)")
+        return 1
+
+
+async def handle_adspower_single(args: argparse.Namespace, base_url: str) -> int:
+    """Одиночный режим: обработка одного профиля AdsPower."""
+    
+    # Проверяем обязательные аргументы для одиночного режима
+    if not args.api_id or not args.api_hash:
+        logging.error("Для одиночного режима требуются --api-id и --api-hash")
+        return 1
+    
+    if not args.profile_id:
+        logging.error("Для одиночного режима требуется --profile-id")
+        return 1
+    
     session_path = Path(args.session).expanduser()
     if not session_path.exists():
         logging.error("Файл сессии не найден: %s", session_path)
         return 1
 
     try:
-        profile = start_adspower_profile(args.adspower_base, args.profile_id)
+        profile = start_adspower_profile(base_url, args.profile_id)
         logging.info("Профиль AdsPower запущен: %s", args.profile_id)
     except Exception as exc:
         logging.error("Не удалось запустить профиль AdsPower: %s", exc)
         return 1
 
-    async with telegram_client_manager(
-        str(session_path), args.api_id, args.api_hash, None, args.connect_timeout
-    ) as client:
-        if not await client.is_user_authorized():
-            logging.error("Сессия %s не авторизована", session_path)
-            stop_adspower_profile(args.adspower_base, args.profile_id)
-            return 1
+    try:
+        async with telegram_client_manager(
+            str(session_path), args.api_id, args.api_hash, None, args.connect_timeout
+        ) as client:
+            if not await client.is_user_authorized():
+                logging.error("Сессия %s не авторизована", session_path)
+                return 1
 
-        me = await client.get_me()
-        phone = args.phone or getattr(me, "phone", None)
-        if not phone:
-            logging.error("Не удалось определить номер телефона из сессии")
-            stop_adspower_profile(args.adspower_base, args.profile_id)
-            return 1
+            me = await client.get_me()
+            phone = args.phone or getattr(me, "phone", None)
+            if not phone:
+                logging.error("Не удалось определить номер телефона из сессии")
+                return 1
 
-        try:
-            telegram_peer = await resolve_telegram_peer(client)
-        except Exception as exc:
-            logging.error("Не удалось определить официальный чат Telegram: %s", exc)
-            stop_adspower_profile(args.adspower_base, args.profile_id)
-            return 1
+            try:
+                telegram_peer = await resolve_telegram_peer(client)
+            except Exception as exc:
+                logging.error("Не удалось определить официальный чат Telegram: %s", exc)
+                return 1
 
-        try:
-            latest = await client.get_messages(telegram_peer, limit=1)
-            baseline_id = latest[0].id if latest else 0
-        except Exception as exc:
+            try:
+                latest = await client.get_messages(telegram_peer, limit=1)
+                baseline_id = latest[0].id if latest else 0
+            except Exception as exc:
+                logging.warning(
+                    "Не удалось получить последнее сообщение от Telegram, стартуем с since_id=0: %s",
+                    exc,
+                )
+                baseline_id = 0
+
+            try:
+                await run_web_login_flow(
+                    client,
+                    profile,
+                    phone,
+                    baseline_msg_id=baseline_id,
+                    code_timeout=args.code_timeout,
+                    poll_interval=args.poll_interval,
+                    two_fa=args.two_fa,
+                    telegram_peer=telegram_peer,
+                )
+                logging.info("Авторизация в web.telegram.org завершена")
+                return 0
+            except Exception as exc:
+                logging.error("Ошибка авторизации через AdsPower: %s", exc)
+                return 1
+    finally:
+        stop_adspower_profile(base_url, args.profile_id)
+
+
+async def handle_adspower_batch(args: argparse.Namespace, base_url: str) -> int:
+    """Пакетный режим: обработка нескольких профилей AdsPower."""
+    
+    # Проверяем обязательные аргументы
+    if not args.api_id or not args.api_hash:
+        logging.error("Для пакетного режима требуются --api-id и --api-hash")
+        return 1
+    
+    # -----------------------------------------------------------------------
+    # 1. Загрузка профилей
+    # -----------------------------------------------------------------------
+    profiles_path = Path(args.profiles).expanduser()
+    if not profiles_path.exists():
+        logging.error("Файл профилей не найден: %s", profiles_path)
+        return 1
+    
+    try:
+        profiles = load_profiles(profiles_path)
+    except Exception as exc:
+        logging.error("Ошибка загрузки профилей: %s", exc)
+        return 1
+    
+    if not profiles:
+        logging.error("Файл профилей пуст или содержит некорректные данные")
+        return 1
+    
+    logging.info("Загружено %d профилей из %s", len(profiles), profiles_path)
+    
+    # Сортируем профили для предсказуемого сопоставления с сессиями
+    profiles.sort(key=lambda p: int(p.serial_number) if p.serial_number.isdigit() else p.serial_number)
+
+    # -----------------------------------------------------------------------
+    # 2. Обработка сессий (Файл или Папка)
+    # -----------------------------------------------------------------------
+    session_arg = Path(args.session).expanduser()
+    sessions: List[Path] = []
+    
+    if session_arg.is_dir():
+        # Если папка - собираем все .session файлы
+        sessions = sorted(list(session_arg.glob("*.session")))
+        if not sessions:
+            logging.error("В папке %s не найдено .session файлов", session_arg)
+            return 1
+        logging.info("Найдено %d сессий в папке %s", len(sessions), session_arg)
+    
+    elif session_arg.is_file():
+        # Если файл - используем одну сессию
+        sessions = [session_arg]
+    else:
+        logging.error("Путь к сессии не найден: %s", session_arg)
+        return 1
+        
+    # -----------------------------------------------------------------------
+    # 3. Привязка сессий к профилям
+    # -----------------------------------------------------------------------
+    
+    if len(sessions) == 1:
+        # Режим "Одна сессия на всех" (обычно для фарминга с одного аккаунта)
+        logging.info("Используем одну сессию для всех %d профилей", len(profiles))
+        for p in profiles:
+            p.session_path = str(sessions[0])
+            
+    else:
+        # Режим "1 к 1" (каталог сессий)
+        logging.info("Распределяем %d сессий по %d профилям (1:1)", len(sessions), len(profiles))
+        
+        if len(sessions) < len(profiles):
             logging.warning(
-                "Не удалось получить последнее сообщение от Telegram, стартуем с since_id=0: %s",
-                exc,
+                "ВНИМАНИЕ: Сессий (%d) меньше чем профилей (%d). Лишние профили будут пропущены!", 
+                len(sessions), len(profiles)
             )
-            baseline_id = 0
+            # Обрезаем список профилей до количества сессий
+            profiles = profiles[:len(sessions)]
+            
+        # Присваиваем сессии профилям по порядку
+        for i, profile in enumerate(profiles):
+            profile.session_path = str(sessions[i])
+            logging.debug("Профиль %s -> Сессия %s", profile.serial_number, sessions[i].name)
 
-        try:
+    # -----------------------------------------------------------------------
+    # 4. Обработчик логина
+    # -----------------------------------------------------------------------
+    
+    # Создаём функцию-обработчик
+    async def single_profile_handler(
+        profile: AdsPowerProfile,
+        session_path: Path,
+        two_fa: Optional[str],
+        code_timeout: int,
+        poll_interval: float,
+    ) -> int:
+        """Обработчик одного профиля."""
+        
+        # Для каждой сессии создаём свой клиент
+        async with telegram_client_manager(
+            str(session_path), args.api_id, args.api_hash, None, args.connect_timeout
+        ) as client:
+            if not await client.is_user_authorized():
+                logging.error("Сессия %s не авторизована", session_path.name)
+                # Возвращаем специальный код ошибки для неавторизованной сессии?
+                # Пока просто логируем и считаем ошибкой процесса
+                raise RuntimeError(f"Сессия {session_path.name} не авторизована")
+            
+            me = await client.get_me()
+            phone = args.phone or getattr(me, "phone", None)
+            if not phone:
+                raise RuntimeError("Не удалось определить номер телефона из сессии")
+            
+            try:
+                telegram_peer = await resolve_telegram_peer(client)
+            except Exception as exc:
+                raise RuntimeError(f"Не удалось определить официальный чат Telegram: {exc}")
+            
+            try:
+                latest = await client.get_messages(telegram_peer, limit=1)
+                baseline_id = latest[0].id if latest else 0
+            except Exception:
+                baseline_id = 0
+            
             await run_web_login_flow(
                 client,
                 profile,
                 phone,
                 baseline_msg_id=baseline_id,
-                code_timeout=args.code_timeout,
-                poll_interval=args.poll_interval,
-                two_fa=args.two_fa,
+                code_timeout=code_timeout,
+                poll_interval=poll_interval,
+                two_fa=two_fa,
                 telegram_peer=telegram_peer,
             )
-            logging.info("Авторизация в web.telegram.org завершена")
             return 0
+        
+    # Запускаем пакетную обработку
+    summary = await process_profiles_batch(
+        profiles=profiles,
+        base_url=base_url,
+        login_handler=single_profile_handler,
+        api_id=args.api_id,
+        api_hash=args.api_hash,
+        concurrency=args.concurrency,
+        delay_between=args.delay_between,
+        code_timeout=args.code_timeout,
+        poll_interval=args.poll_interval,
+    )
+    
+    # Сохраняем отчёт
+    if args.report:
+        try:
+            save_batch_report(summary.results, args.report)
         except Exception as exc:
-            logging.error("Ошибка авторизации через AdsPower: %s", exc)
-            return 1
-        finally:
-            stop_adspower_profile(args.adspower_base, args.profile_id)
+            logging.warning("Не удалось сохранить отчёт: %s", exc)
+    
+    # Выводим итоги
+    logging.info("=" * 50)
+    logging.info("ИТОГИ ПАКЕТНОЙ ОБРАБОТКИ")
+    logging.info("=" * 50)
+    logging.info("Всего профилей: %d", summary.total)
+    logging.info("Успешно: %d", summary.success)
+    logging.info("Ошибок: %d", summary.failed)
+    
+    if summary.failed > 0:
+        logging.info("Профили с ошибками:")
+        for result in summary.results:
+            if not result.success:
+                logging.info("  - [%s]: %s", result.serial_number, result.error)
+    
+    return 0 if summary.failed == 0 else 2
+
+
 
 
 async def handle_check(args: argparse.Namespace) -> int:
+    check_environment("telethon")
     args.concurrency = max(1, min(50, args.concurrency))
+
     sources: List[SourceItem] = []
     seen_paths: Set[Path] = set()
     discovery_errors: List[SourceError] = []
@@ -2398,12 +2777,14 @@ async def handle_check(args: argparse.Namespace) -> int:
 
 
 async def handle_convert(args: argparse.Namespace) -> int:
+    check_environment("telethon")
     mode = args.mode
     input_path = Path(args.input).expanduser()
     output_dir = Path(args.output).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if mode == "tdata-to-session":
+        check_environment("tdata")
         if not input_path.exists():
             logging.error("Каталог %s не найден", input_path)
             return 1
